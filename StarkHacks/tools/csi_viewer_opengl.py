@@ -20,7 +20,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="ESP32 CSI viewer (OpenCV OpenGL window)")
     parser.add_argument("--port", required=True, help="Serial port (for example /dev/ttyACM0 or COM5)")
     parser.add_argument("--baud", type=int, default=921600, help="Serial baud rate")
-    parser.add_argument("--bins", type=int, default=64, help="Number of CSI magnitude bins to display")
+    parser.add_argument("--bins", type=int, default=64, help="Number of CSI bins to display")
     parser.add_argument("--history", type=int, default=240, help="Waterfall rows")
     parser.add_argument("--webcam", default="", help="Optional webcam index or path")
     return parser.parse_args()
@@ -48,27 +48,76 @@ def open_camera(source):
 
 
 def parse_csi_line(line):
-    # Expected format:
-    # CSI,<seq>,<rssi>,<raw_len>,<bins>,<mag_0>,...,<mag_n>
-    if not line.startswith("CSI,"):
+    line = line.strip()
+    if not line:
         return None
 
-    parts = line.strip().split(",")
+    parts = line.split(",")
     if len(parts) < 6:
         return None
 
-    try:
-        seq = int(parts[1])
-        rssi = int(parts[2])
-        raw_len = int(parts[3])
-        bins = int(parts[4])
-        mags = [int(v) for v in parts[5:]]
-    except ValueError:
-        return None
+    if parts[0] == "CSIv1":
+        try:
+            seq = int(parts[1])
+            rssi = int(parts[2])
+            raw_len = int(parts[3])
+            bins = int(parts[4])
+        except ValueError:
+            return None
 
-    if bins <= 0 or len(mags) == 0:
-        return None
-    return seq, rssi, raw_len, bins, mags
+        if bins <= 0:
+            return None
+
+        expected_len = 7 + (2 * bins)
+        if len(parts) != expected_len:
+            return None
+        if parts[5] != "A":
+            return None
+        phase_marker_index = 6 + bins
+        if parts[phase_marker_index] != "P":
+            return None
+
+        try:
+            amps = [int(v) for v in parts[6:phase_marker_index]]
+            phases = [int(v) for v in parts[phase_marker_index + 1 :]]
+        except ValueError:
+            return None
+        if len(amps) != bins or len(phases) != bins:
+            return None
+        return {
+            "seq": seq,
+            "rssi": rssi,
+            "raw_len": raw_len,
+            "bins": bins,
+            "amp": amps,
+            "phase": phases,
+            "version": "CSIv1",
+        }
+
+    # Backward-compatible parser for legacy firmware:
+    # CSI,<seq>,<rssi>,<raw_len>,<bins>,<mag_0>,...,<mag_n>
+    if parts[0] == "CSI":
+        try:
+            seq = int(parts[1])
+            rssi = int(parts[2])
+            raw_len = int(parts[3])
+            bins = int(parts[4])
+            mags = [int(v) for v in parts[5:]]
+        except ValueError:
+            return None
+        if bins <= 0 or len(mags) == 0:
+            return None
+        return {
+            "seq": seq,
+            "rssi": rssi,
+            "raw_len": raw_len,
+            "bins": bins,
+            "amp": mags,
+            "phase": [0] * len(mags),
+            "version": "CSI",
+        }
+
+    return None
 
 
 def draw_overlay(img, text, y):
@@ -84,10 +133,12 @@ def main():
     ser = serial.Serial(args.port, args.baud, timeout=0.03)
     cam = open_camera(args.webcam)
 
-    waterfall = np.zeros((args.history, args.bins), dtype=np.uint8)
+    amp_waterfall = np.zeros((args.history, args.bins), dtype=np.uint8)
+    phase_waterfall = np.zeros((args.history, args.bins), dtype=np.uint8)
     latest_seq = 0
     latest_rssi = -127
     latest_len = 0
+    latest_version = "N/A"
     fps_counter = 0
     fps_time = time.time()
     fps = 0.0
@@ -104,31 +155,52 @@ def main():
             line = ser.readline().decode("utf-8", errors="ignore").strip()
             parsed = parse_csi_line(line) if line else None
             if parsed is not None:
-                latest_seq, latest_rssi, latest_len, bins, mags = parsed
-                row = np.zeros((args.bins,), dtype=np.uint8)
-                clipped = np.array(mags[: args.bins], dtype=np.float32)
-                if clipped.size > 0:
-                    vmax = max(32.0, float(np.percentile(clipped, 98)))
-                    clipped = np.clip((clipped / vmax) * 255.0, 0, 255)
-                    row[: clipped.shape[0]] = clipped.astype(np.uint8)
+                latest_seq = parsed["seq"]
+                latest_rssi = parsed["rssi"]
+                latest_len = parsed["raw_len"]
+                latest_version = parsed["version"]
 
-                waterfall = np.roll(waterfall, -1, axis=0)
-                waterfall[-1, :] = row
+                amp_row = np.zeros((args.bins,), dtype=np.uint8)
+                phase_row = np.zeros((args.bins,), dtype=np.uint8)
 
-            heatmap = cv2.applyColorMap(waterfall, cv2.COLORMAP_TURBO)
-            heatmap = cv2.resize(heatmap, (900, 700), interpolation=cv2.INTER_LINEAR)
+                amp = np.array(parsed["amp"][: args.bins], dtype=np.float32)
+                if amp.size > 0:
+                    amp = np.clip(amp, 0.0, 255.0)
+                    vmax = max(32.0, float(np.percentile(amp, 98)))
+                    amp = np.clip((amp / vmax) * 255.0, 0, 255)
+                    amp_row[: amp.shape[0]] = amp.astype(np.uint8)
 
-            draw_overlay(heatmap, f"CSI seq: {latest_seq}", 26)
-            draw_overlay(heatmap, f"RSSI: {latest_rssi} dBm", 52)
-            draw_overlay(heatmap, f"Raw len: {latest_len}", 78)
-            draw_overlay(heatmap, "Press q to quit", 104)
+                phase = np.array(parsed["phase"][: args.bins], dtype=np.float32)
+                if phase.size > 0:
+                    phase = np.clip(phase, -18000.0, 18000.0)
+                    phase = ((phase + 18000.0) / 36000.0) * 255.0
+                    phase_row[: phase.shape[0]] = np.clip(phase, 0, 255).astype(np.uint8)
+
+                amp_waterfall = np.roll(amp_waterfall, -1, axis=0)
+                amp_waterfall[-1, :] = amp_row
+                phase_waterfall = np.roll(phase_waterfall, -1, axis=0)
+                phase_waterfall[-1, :] = phase_row
+
+            amp_map = cv2.applyColorMap(amp_waterfall, cv2.COLORMAP_TURBO)
+            phase_map = cv2.applyColorMap(phase_waterfall, cv2.COLORMAP_HSV)
+            amp_map = cv2.resize(amp_map, (900, 340), interpolation=cv2.INTER_LINEAR)
+            phase_map = cv2.resize(phase_map, (900, 340), interpolation=cv2.INTER_LINEAR)
+            heatmap = np.vstack([amp_map, phase_map])
+
+            draw_overlay(heatmap, "Amplitude", 26)
+            draw_overlay(heatmap, "Phase", 366)
+            draw_overlay(heatmap, f"CSI seq: {latest_seq}", 52)
+            draw_overlay(heatmap, f"RSSI: {latest_rssi} dBm", 78)
+            draw_overlay(heatmap, f"Raw len: {latest_len}", 104)
+            draw_overlay(heatmap, f"Format: {latest_version}", 130)
+            draw_overlay(heatmap, "Press q to quit", 156)
 
             if cam is not None:
                 ok, frame = cam.read()
                 if ok:
-                    frame = cv2.resize(frame, (360, 700), interpolation=cv2.INTER_AREA)
+                    frame = cv2.resize(frame, (360, 680), interpolation=cv2.INTER_AREA)
                 else:
-                    frame = np.zeros((700, 360, 3), dtype=np.uint8)
+                    frame = np.zeros((680, 360, 3), dtype=np.uint8)
                     draw_overlay(frame, "Webcam read failed", 40)
                 canvas = np.hstack([heatmap, frame])
             else:

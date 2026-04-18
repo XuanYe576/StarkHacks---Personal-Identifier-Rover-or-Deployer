@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <ESP32Servo.h>
 #include <WiFi.h>
+#include <math.h>
 extern "C" {
 #include "esp_wifi.h"
 }
@@ -40,7 +41,8 @@ struct CsiFrame {
   int8_t rssi;
   uint16_t rawLen;
   uint8_t bins;
-  uint8_t magnitude[MAX_CSI_BINS];
+  uint8_t amplitude[MAX_CSI_BINS];
+  int16_t phaseCentiDeg[MAX_CSI_BINS];
 };
 
 CsiFrame latestFrame = {};
@@ -82,7 +84,7 @@ void printWifiStatus() {
 }
 
 void streamCsiFrame(const CsiFrame &frame) {
-  Serial.print("CSI,");
+  Serial.print("CSIv1,");
   Serial.print(frame.seq);
   Serial.print(",");
   Serial.print(frame.rssi);
@@ -90,9 +92,15 @@ void streamCsiFrame(const CsiFrame &frame) {
   Serial.print(frame.rawLen);
   Serial.print(",");
   Serial.print(frame.bins);
+  Serial.print(",A");
   for (int i = 0; i < frame.bins; ++i) {
     Serial.print(",");
-    Serial.print(frame.magnitude[i]);
+    Serial.print(frame.amplitude[i]);
+  }
+  Serial.print(",P");
+  for (int i = 0; i < frame.bins; ++i) {
+    Serial.print(",");
+    Serial.print(frame.phaseCentiDeg[i]);
   }
   Serial.println();
 }
@@ -120,11 +128,26 @@ void onCsiReceived(void *ctx, wifi_csi_info_t *info) {
   for (int i = 0; i < frame.bins; ++i) {
     int imag = static_cast<int8_t>(info->buf[i * 2]);
     int real = static_cast<int8_t>(info->buf[i * 2 + 1]);
-    int mag = abs(imag) + abs(real);
-    if (mag > 255) {
-      mag = 255;
+
+    float amplitude = sqrtf(static_cast<float>(real * real + imag * imag));
+    int ampQuantized = static_cast<int>(roundf(amplitude));
+    if (ampQuantized < 0) {
+      ampQuantized = 0;
     }
-    frame.magnitude[i] = static_cast<uint8_t>(mag);
+    if (ampQuantized > 255) {
+      ampQuantized = 255;
+    }
+    frame.amplitude[i] = static_cast<uint8_t>(ampQuantized);
+
+    float phaseDeg = atan2f(static_cast<float>(imag), static_cast<float>(real)) * 57.2957795f;
+    int phaseCentiDeg = static_cast<int>(roundf(phaseDeg * 100.0f));
+    if (phaseCentiDeg < -18000) {
+      phaseCentiDeg = -18000;
+    }
+    if (phaseCentiDeg > 18000) {
+      phaseCentiDeg = 18000;
+    }
+    frame.phaseCentiDeg[i] = static_cast<int16_t>(phaseCentiDeg);
   }
 
   portENTER_CRITICAL(&csiMux);
@@ -277,7 +300,7 @@ void setup() {
   connectWifi();
   configureCsi();
   Serial.println("CSI serial format:");
-  Serial.println("CSI,<seq>,<rssi>,<raw_len>,<bins>,<mag_0>,...,<mag_n>");
+  Serial.println("CSIv1,<seq>,<rssi>,<raw_len>,<bins>,A,<amp_0>,...,<amp_n>,P,<phase_0>,...,<phase_n>");
 }
 
 void loop() {

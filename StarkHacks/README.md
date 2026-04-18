@@ -9,7 +9,11 @@ This firmware does two things at once:
 - Serial speed: `921600`
 - Servo command format:
   - `E<angle> A<angle>` (example: `E110 A45`)
-- CSI stream line format:
+- CSI stream line format (current, versioned):
+  - `CSIv1,<seq>,<rssi>,<raw_len>,<bins>,A,<amp_0>,...,<amp_(bins-1)>,P,<phase_0>,...,<phase_(bins-1)>`
+  - `amp_i`: amplitude from CSI IQ pair `sqrt(I^2 + Q^2)`, quantized to `0..255`
+  - `phase_i`: phase from CSI IQ pair `atan2(I, Q)` in centi-degrees (`-18000..18000`)
+- Legacy CSI format still accepted by the viewer:
   - `CSI,<seq>,<rssi>,<raw_len>,<bins>,<mag_0>,...,<mag_n>`
 
 ## Wi-Fi credentials
@@ -36,6 +40,10 @@ Run:
 python3 tools/csi_viewer_opengl.py --port /dev/ttyACM0 --baud 921600
 ```
 
+This viewer shows two CSI panels:
+- Top: amplitude waterfall
+- Bottom: phase waterfall
+
 With webcam in same OpenGL window:
 
 ```bash
@@ -48,4 +56,3 @@ You can also pass webcam index (for example `--webcam 0`).
 
 Recorded hardware note:
 - Logitech Brio 105 webcam connected by USB directly to the computer.
-
