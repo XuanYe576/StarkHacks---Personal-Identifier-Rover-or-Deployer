@@ -14,7 +14,7 @@ PANEL_W = CANVAS_W // 2
 PANEL_H = CANVAS_H
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-YOLO_REPO = REPO_ROOT / "third_party" / "YOLOv7-DeepSORT-Human-Tracking"
+YOLO_REPO = REPO_ROOT / "lib" / "YOLOv7-DeepSORT-Human-Tracking"
 
 
 def camera_backends():
@@ -336,7 +336,7 @@ def main():
             except Exception as exc:
                 raise RuntimeError(
                     f"Failed to init YOLO+DeepSORT backend: {exc}\n"
-                    "Use the YOLO venv and ensure weights exist in third_party/YOLOv7-DeepSORT-Human-Tracking/checkpoints/"
+                    "Use the YOLO venv and ensure weights exist in lib/YOLOv7-DeepSORT-Human-Tracking/checkpoints/"
                 ) from exc
     camera_serial = None
     if args.camera_serial_port:

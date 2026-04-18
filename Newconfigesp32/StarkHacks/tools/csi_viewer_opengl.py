@@ -888,7 +888,7 @@ class DetectionProcess(multiprocessing.Process):
         Initialise YOLOv7 + DeepSORT tracker.
         """
         yolo_path = os.path.join(
-            os.path.dirname(__file__), "..", "third_party", "YOLOv7-DeepSORT-Human-Tracking"
+            os.path.dirname(__file__), "..", "..", "..", "lib", "YOLOv7-DeepSORT-Human-Tracking"
         )
         yolo_path = os.path.abspath(yolo_path)
         if yolo_path not in sys.path:

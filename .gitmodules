@@ -7,6 +7,3 @@
 [submodule "third_party/gr-ieee802-11"]
 	path = third_party/gr-ieee802-11
 	url = https://github.com/bastibl/gr-ieee802-11.git
-[submodule "third_party/YOLOv7-DeepSORT-Human-Tracking"]
-	path = third_party/YOLOv7-DeepSORT-Human-Tracking
-	url = https://github.com/dasupradyumna/YOLOv7-DeepSORT-Human-Tracking.git
