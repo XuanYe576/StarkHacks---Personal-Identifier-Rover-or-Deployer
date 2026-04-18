@@ -365,6 +365,27 @@ python main.py \
     --config config.yaml
 ```
 
+### TF-Luna LiDAR Reconstruction (Max Resolution)
+
+Capture TF-Luna over UART and reconstruct a dense 3D cloud (one point per valid sample):
+
+```bash
+python tfluna_reconstruct.py \
+  --port /dev/ttyUSB0 \
+  --baudrate 115200 \
+  --seconds 8 \
+  --azimuth-min -90 \
+  --azimuth-max 90 \
+  --elevation 0 \
+  --out tfluna_cloud.ply \
+  --csv tfluna_capture.csv
+```
+
+Notes:
+- `tfluna_capture.csv` stores raw + angle-tagged scan samples.
+- `tfluna_cloud.ply` stores reconstructed XYZ points at max capture resolution.
+- Use real servo/encoder angles for best geometric accuracy.
+
 ### Command-Line Arguments
 
 | Argument | Type | Default | Description |

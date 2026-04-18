@@ -21,8 +21,15 @@ def parse_args():
     parser.add_argument("--port", required=True, help="Serial port (for example /dev/ttyACM0 or COM5)")
     parser.add_argument("--baud", type=int, default=921600, help="Serial baud rate")
     parser.add_argument("--bins", type=int, default=64, help="Number of CSI bins to display")
-    parser.add_argument("--history", type=int, default=240, help="Waterfall rows")
     parser.add_argument("--webcam", default="", help="Optional webcam index or path")
+    parser.add_argument("--stereo-right", default="", help="Optional right camera index/path for stereo interface")
+    parser.add_argument("--stereo-detect", action="store_true", help="Enable built-in people detect/parallax overlay")
+    parser.add_argument("--stereo-detect-interval", type=int, default=6, help="Run detector every N frames")
+    parser.add_argument("--stereo-baseline-m", type=float, default=0.20, help="Stereo baseline in meters")
+    parser.add_argument("--stereo-focal-px", type=float, default=0.0, help="Calibrated focal length in pixels")
+    parser.add_argument("--stereo-hfov-deg", type=float, default=78.0, help="HFOV used when focal-px is 0")
+    parser.add_argument("--camera-serial-port", default="", help="Optional serial plugin port for camera metadata")
+    parser.add_argument("--camera-serial-baud", type=int, default=115200, help="Baud for camera serial plugin")
     return parser.parse_args()
 
 
@@ -125,23 +132,102 @@ def draw_overlay(img, text, y):
     cv2.putText(img, text, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 1, cv2.LINE_AA)
 
 
+def draw_wave(amp_values, width=900, height=330, color=(0, 0, 255)):
+    canvas = np.zeros((height, width, 3), dtype=np.uint8)
+    if amp_values is None or len(amp_values) == 0:
+        return canvas
+
+    amp = np.array(amp_values, dtype=np.float32)
+    amp = np.clip(amp, 0.0, 255.0)
+    vmax = max(32.0, float(np.percentile(amp, 98)))
+    amp = np.clip(amp / vmax, 0.0, 1.0)
+
+    n = amp.shape[0]
+    if n == 1:
+        x = np.array([width // 2], dtype=np.int32)
+    else:
+        x = np.linspace(0, width - 1, n).astype(np.int32)
+    y = (height - 20 - (amp * (height - 40))).astype(np.int32)
+
+    pts = np.stack([x, y], axis=1).reshape((-1, 1, 2))
+    cv2.polylines(canvas, [pts], isClosed=False, color=color, thickness=2)
+    return canvas
+
+
+def fft_magnitude(values, out_bins):
+    arr = np.asarray(values, dtype=np.float32)
+    if arr.size == 0:
+        return np.zeros((out_bins,), dtype=np.float32)
+    arr = arr - np.mean(arr)
+    spec = np.fft.rfft(arr)
+    mag = np.abs(spec)
+    if mag.size > out_bins:
+        mag = mag[:out_bins]
+    out = np.zeros((out_bins,), dtype=np.float32)
+    out[: mag.shape[0]] = mag
+    return out
+
+
+def detect_primary_person(frame, hog):
+    small = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+    rects, weights = hog.detectMultiScale(small, winStride=(8, 8), padding=(8, 8), scale=1.05)
+    if len(rects) == 0:
+        return None
+    best_idx = int(np.argmax(weights)) if len(weights) else 0
+    x, y, w, h = rects[best_idx]
+    x *= 2
+    y *= 2
+    w *= 2
+    h *= 2
+    return (int(x), int(y), int(w), int(h))
+
+
+def render_stereo_panel(frame_left, frame_right, info_line):
+    left = cv2.resize(frame_left, (360, 330), interpolation=cv2.INTER_AREA)
+    right = cv2.resize(frame_right, (360, 330), interpolation=cv2.INTER_AREA)
+    panel = np.zeros((680, 360, 3), dtype=np.uint8)
+    panel[0:330, :, :] = left
+    panel[350:680, :, :] = right
+    cv2.line(panel, (0, 340), (359, 340), (40, 40, 40), 1)
+    draw_overlay(panel, "LEFT", 24)
+    draw_overlay(panel, "RIGHT", 374)
+    draw_overlay(panel, info_line, 654)
+    return panel
+
+
 def main():
     args = parse_args()
     args.bins = max(8, args.bins)
-    args.history = max(64, args.history)
+    args.stereo_detect_interval = max(1, args.stereo_detect_interval)
 
     ser = serial.Serial(args.port, args.baud, timeout=0.03)
-    cam = open_camera(args.webcam)
+    cam_left = open_camera(args.webcam)
+    cam_right = open_camera(args.stereo_right) if args.stereo_right else None
+    hog = None
+    if args.stereo_detect:
+        hog = cv2.HOGDescriptor()
+        hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+    camera_serial = None
+    if args.camera_serial_port:
+        try:
+            camera_serial = serial.Serial(args.camera_serial_port, args.camera_serial_baud, timeout=0.0)
+        except Exception as exc:
+            print(f"[WARN] camera serial plugin disabled: {exc}")
+            camera_serial = None
 
-    amp_waterfall = np.zeros((args.history, args.bins), dtype=np.uint8)
-    phase_waterfall = np.zeros((args.history, args.bins), dtype=np.uint8)
     latest_seq = 0
     latest_rssi = -127
     latest_len = 0
     latest_version = "N/A"
+    latest_amp = np.zeros((args.bins,), dtype=np.uint8)
+    latest_cam_serial = "N/A"
     fps_counter = 0
     fps_time = time.time()
     fps = 0.0
+    stereo_info = "stereo off"
+    detect_frame_i = 0
+    cached_left_box = None
+    cached_right_box = None
 
     window_name = "CSI OpenGL Viewer"
     try:
@@ -159,52 +245,85 @@ def main():
                 latest_rssi = parsed["rssi"]
                 latest_len = parsed["raw_len"]
                 latest_version = parsed["version"]
-
-                amp_row = np.zeros((args.bins,), dtype=np.uint8)
-                phase_row = np.zeros((args.bins,), dtype=np.uint8)
-
                 amp = np.array(parsed["amp"][: args.bins], dtype=np.float32)
+                latest_amp[:] = 0
                 if amp.size > 0:
                     amp = np.clip(amp, 0.0, 255.0)
-                    vmax = max(32.0, float(np.percentile(amp, 98)))
-                    amp = np.clip((amp / vmax) * 255.0, 0, 255)
-                    amp_row[: amp.shape[0]] = amp.astype(np.uint8)
+                    latest_amp[: amp.shape[0]] = amp.astype(np.uint8)
 
-                phase = np.array(parsed["phase"][: args.bins], dtype=np.float32)
-                if phase.size > 0:
-                    phase = np.clip(phase, -18000.0, 18000.0)
-                    phase = ((phase + 18000.0) / 36000.0) * 255.0
-                    phase_row[: phase.shape[0]] = np.clip(phase, 0, 255).astype(np.uint8)
+            if camera_serial is not None:
+                cam_line = camera_serial.readline().decode("utf-8", errors="ignore").strip()
+                if cam_line:
+                    latest_cam_serial = cam_line
 
-                amp_waterfall = np.roll(amp_waterfall, -1, axis=0)
-                amp_waterfall[-1, :] = amp_row
-                phase_waterfall = np.roll(phase_waterfall, -1, axis=0)
-                phase_waterfall[-1, :] = phase_row
+            fft_vals = fft_magnitude(latest_amp, args.bins)
+            raw_wave = draw_wave(latest_amp, width=900, height=330, color=(0, 0, 255))
+            fft_wave = draw_wave(fft_vals, width=900, height=330, color=(255, 255, 0))
+            wave = np.zeros((680, 900, 3), dtype=np.uint8)
+            wave[0:330, :, :] = raw_wave
+            wave[350:680, :, :] = fft_wave
+            cv2.line(wave, (0, 340), (899, 340), (40, 40, 40), 1)
+            draw_overlay(wave, "RAW Amplitude Wave (Red)", 26)
+            draw_overlay(wave, "FFT Amplitude Wave (Yellow)", 376)
+            draw_overlay(wave, f"CSI seq: {latest_seq}", 52)
+            draw_overlay(wave, f"RSSI: {latest_rssi} dBm", 78)
+            draw_overlay(wave, f"Raw len: {latest_len}", 104)
+            draw_overlay(wave, f"Format: {latest_version}", 130)
+            if camera_serial is not None:
+                draw_overlay(wave, f"Camera serial: {latest_cam_serial[:90]}", 156)
+            draw_overlay(wave, "Press q to quit", 182)
 
-            amp_map = cv2.applyColorMap(amp_waterfall, cv2.COLORMAP_TURBO)
-            phase_map = cv2.applyColorMap(phase_waterfall, cv2.COLORMAP_HSV)
-            amp_map = cv2.resize(amp_map, (900, 340), interpolation=cv2.INTER_LINEAR)
-            phase_map = cv2.resize(phase_map, (900, 340), interpolation=cv2.INTER_LINEAR)
-            heatmap = np.vstack([amp_map, phase_map])
+            if cam_left is not None and cam_right is not None:
+                ok_l, frame_l = cam_left.read()
+                ok_r, frame_r = cam_right.read()
+                if ok_l and ok_r:
+                    detect_frame_i += 1
+                    if hog is not None and (detect_frame_i % args.stereo_detect_interval == 0):
+                        cached_left_box = detect_primary_person(frame_l, hog)
+                        cached_right_box = detect_primary_person(frame_r, hog)
 
-            draw_overlay(heatmap, "Amplitude", 26)
-            draw_overlay(heatmap, "Phase", 366)
-            draw_overlay(heatmap, f"CSI seq: {latest_seq}", 52)
-            draw_overlay(heatmap, f"RSSI: {latest_rssi} dBm", 78)
-            draw_overlay(heatmap, f"Raw len: {latest_len}", 104)
-            draw_overlay(heatmap, f"Format: {latest_version}", 130)
-            draw_overlay(heatmap, "Press q to quit", 156)
+                    if cached_left_box is not None:
+                        x, y, w, h = cached_left_box
+                        cv2.rectangle(frame_l, (x, y), (x + w, y + h), (0, 255, 255), 2)
+                    if cached_right_box is not None:
+                        x, y, w, h = cached_right_box
+                        cv2.rectangle(frame_r, (x, y), (x + w, y + h), (0, 255, 255), 2)
 
-            if cam is not None:
-                ok, frame = cam.read()
+                    stereo_info = "stereo on"
+                    if cached_left_box is not None and cached_right_box is not None:
+                        cx_l = cached_left_box[0] + (cached_left_box[2] * 0.5)
+                        cx_r = cached_right_box[0] + (cached_right_box[2] * 0.5)
+                        disparity = cx_l - cx_r
+                        if disparity > 1.0:
+                            focal_px = args.stereo_focal_px
+                            if focal_px <= 0.0:
+                                focal_px = (frame_l.shape[1] * 0.5) / np.tan(np.radians(args.stereo_hfov_deg * 0.5))
+                            depth = (args.stereo_baseline_m * focal_px) / disparity
+                            stereo_info = f"stereo detect ON d={disparity:.1f}px z={depth:.2f}m"
+                        else:
+                            stereo_info = f"stereo detect ON d={disparity:.1f}px"
+
+                    stereo_panel = render_stereo_panel(frame_l, frame_r, stereo_info[:54])
+                    if camera_serial is not None:
+                        draw_overlay(stereo_panel, f"Serial: {latest_cam_serial[:34]}", 40)
+                    canvas = np.hstack([wave, stereo_panel])
+                else:
+                    fallback = np.zeros((680, 360, 3), dtype=np.uint8)
+                    draw_overlay(fallback, "Stereo camera read failed", 40)
+                    canvas = np.hstack([wave, fallback])
+            elif cam_left is not None:
+                ok, frame = cam_left.read()
                 if ok:
                     frame = cv2.resize(frame, (360, 680), interpolation=cv2.INTER_AREA)
+                    if camera_serial is not None:
+                        draw_overlay(frame, f"Serial: {latest_cam_serial[:48]}", 40)
+                    draw_overlay(frame, "Stereo off (set --stereo-right)", 66)
                 else:
                     frame = np.zeros((680, 360, 3), dtype=np.uint8)
                     draw_overlay(frame, "Webcam read failed", 40)
-                canvas = np.hstack([heatmap, frame])
+                canvas = np.hstack([wave, frame])
             else:
-                canvas = heatmap
+                canvas = wave
 
             now = time.time()
             fps_counter += 1
@@ -220,8 +339,12 @@ def main():
                 break
     finally:
         ser.close()
-        if cam is not None:
-            cam.release()
+        if camera_serial is not None:
+            camera_serial.close()
+        if cam_left is not None:
+            cam_left.release()
+        if cam_right is not None:
+            cam_right.release()
         cv2.destroyAllWindows()
 
 
