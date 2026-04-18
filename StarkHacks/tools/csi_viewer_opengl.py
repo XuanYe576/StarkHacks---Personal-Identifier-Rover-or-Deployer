@@ -132,7 +132,7 @@ def draw_overlay(img, text, y):
     cv2.putText(img, text, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 1, cv2.LINE_AA)
 
 
-def draw_wave(amp_values, width=900, height=330, color=(0, 0, 255)):
+def draw_wave(amp_values, width=900, height=680, color=(0, 0, 255)):
     canvas = np.zeros((height, width, 3), dtype=np.uint8)
     if amp_values is None or len(amp_values) == 0:
         return canvas
@@ -152,6 +152,24 @@ def draw_wave(amp_values, width=900, height=330, color=(0, 0, 255)):
     pts = np.stack([x, y], axis=1).reshape((-1, 1, 2))
     cv2.polylines(canvas, [pts], isClosed=False, color=color, thickness=2)
     return canvas
+
+
+def draw_wave_on_canvas(canvas, amp_values, color=(0, 0, 255), inset=20):
+    if amp_values is None or len(amp_values) == 0:
+        return
+    h, w = canvas.shape[:2]
+    amp = np.array(amp_values, dtype=np.float32)
+    amp = np.clip(amp, 0.0, 255.0)
+    vmax = max(32.0, float(np.percentile(amp, 98)))
+    amp = np.clip(amp / vmax, 0.0, 1.0)
+    n = amp.shape[0]
+    if n == 1:
+        x = np.array([w // 2], dtype=np.int32)
+    else:
+        x = np.linspace(0, w - 1, n).astype(np.int32)
+    y = (h - inset - (amp * (h - (2 * inset)))).astype(np.int32)
+    pts = np.stack([x, y], axis=1).reshape((-1, 1, 2))
+    cv2.polylines(canvas, [pts], isClosed=False, color=color, thickness=2)
 
 
 def fft_magnitude(values, out_bins):
@@ -183,16 +201,34 @@ def detect_primary_person(frame, hog):
 
 
 def render_stereo_panel(frame_left, frame_right, info_line):
-    left = cv2.resize(frame_left, (360, 330), interpolation=cv2.INTER_AREA)
-    right = cv2.resize(frame_right, (360, 330), interpolation=cv2.INTER_AREA)
-    panel = np.zeros((680, 360, 3), dtype=np.uint8)
-    panel[0:330, :, :] = left
-    panel[350:680, :, :] = right
-    cv2.line(panel, (0, 340), (359, 340), (40, 40, 40), 1)
-    draw_overlay(panel, "LEFT", 24)
-    draw_overlay(panel, "RIGHT", 374)
-    draw_overlay(panel, info_line, 654)
+    left = fit_frame_with_padding(frame_left, 450, 680)
+    right = fit_frame_with_padding(frame_right, 450, 680)
+    panel = np.zeros((680, 900, 3), dtype=np.uint8)
+    # Requested order: [cam1][cam0]
+    panel[:, 0:450, :] = right
+    panel[:, 450:900, :] = left
+    cv2.line(panel, (450, 0), (450, 679), (50, 50, 50), 1)
+    draw_overlay(panel, "CAM1", 24)
+    cv2.putText(panel, "CAM0", (462, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(panel, "CAM0", (462, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 1, cv2.LINE_AA)
+    cv2.putText(panel, info_line, (12, 654), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(panel, info_line, (12, 654), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 1, cv2.LINE_AA)
     return panel
+
+
+def fit_frame_with_padding(frame, target_w, target_h):
+    h, w = frame.shape[:2]
+    if h <= 0 or w <= 0:
+        return np.zeros((target_h, target_w, 3), dtype=np.uint8)
+    scale = min(target_w / float(w), target_h / float(h))
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    out = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+    x0 = (target_w - new_w) // 2
+    y0 = (target_h - new_h) // 2
+    out[y0:y0 + new_h, x0:x0 + new_w] = resized
+    return out
 
 
 def main():
@@ -257,21 +293,7 @@ def main():
                     latest_cam_serial = cam_line
 
             fft_vals = fft_magnitude(latest_amp, args.bins)
-            raw_wave = draw_wave(latest_amp, width=900, height=330, color=(0, 0, 255))
-            fft_wave = draw_wave(fft_vals, width=900, height=330, color=(255, 255, 0))
             wave = np.zeros((680, 900, 3), dtype=np.uint8)
-            wave[0:330, :, :] = raw_wave
-            wave[350:680, :, :] = fft_wave
-            cv2.line(wave, (0, 340), (899, 340), (40, 40, 40), 1)
-            draw_overlay(wave, "RAW Amplitude Wave (Red)", 26)
-            draw_overlay(wave, "FFT Amplitude Wave (Yellow)", 376)
-            draw_overlay(wave, f"CSI seq: {latest_seq}", 52)
-            draw_overlay(wave, f"RSSI: {latest_rssi} dBm", 78)
-            draw_overlay(wave, f"Raw len: {latest_len}", 104)
-            draw_overlay(wave, f"Format: {latest_version}", 130)
-            if camera_serial is not None:
-                draw_overlay(wave, f"Camera serial: {latest_cam_serial[:90]}", 156)
-            draw_overlay(wave, "Press q to quit", 182)
 
             if cam_left is not None and cam_right is not None:
                 ok_l, frame_l = cam_left.read()
@@ -306,23 +328,45 @@ def main():
                     stereo_panel = render_stereo_panel(frame_l, frame_r, stereo_info[:54])
                     if camera_serial is not None:
                         draw_overlay(stereo_panel, f"Serial: {latest_cam_serial[:34]}", 40)
-                    canvas = np.hstack([wave, stereo_panel])
+                    # Overlay CSI graph directly over [cam1][cam0] interface.
+                    draw_wave_on_canvas(stereo_panel, fft_vals, color=(255, 255, 0), inset=80)
+                    draw_wave_on_canvas(stereo_panel, latest_amp, color=(0, 0, 255), inset=80)
+                    draw_overlay(stereo_panel, "CSI overlay: RAW=Red FFT=Yellow", 52)
+                    draw_overlay(stereo_panel, f"seq={latest_seq} rssi={latest_rssi} len={latest_len} fmt={latest_version}", 78)
+                    if camera_serial is not None:
+                        draw_overlay(stereo_panel, f"Camera serial: {latest_cam_serial[:70]}", 104)
+                    draw_overlay(stereo_panel, "Press q to quit", 130)
+                    canvas = stereo_panel
                 else:
-                    fallback = np.zeros((680, 360, 3), dtype=np.uint8)
+                    fallback = np.zeros((680, 900, 3), dtype=np.uint8)
                     draw_overlay(fallback, "Stereo camera read failed", 40)
-                    canvas = np.hstack([wave, fallback])
+                    draw_wave_on_canvas(fallback, fft_vals, color=(255, 255, 0), inset=80)
+                    draw_wave_on_canvas(fallback, latest_amp, color=(0, 0, 255), inset=80)
+                    canvas = fallback
             elif cam_left is not None:
                 ok, frame = cam_left.read()
                 if ok:
-                    frame = cv2.resize(frame, (360, 680), interpolation=cv2.INTER_AREA)
+                    frame = fit_frame_with_padding(frame, 900, 680)
                     if camera_serial is not None:
                         draw_overlay(frame, f"Serial: {latest_cam_serial[:48]}", 40)
                     draw_overlay(frame, "Stereo off (set --stereo-right)", 66)
                 else:
-                    frame = np.zeros((680, 360, 3), dtype=np.uint8)
+                    frame = np.zeros((680, 900, 3), dtype=np.uint8)
                     draw_overlay(frame, "Webcam read failed", 40)
-                canvas = np.hstack([wave, frame])
+                draw_wave_on_canvas(frame, fft_vals, color=(255, 255, 0), inset=80)
+                draw_wave_on_canvas(frame, latest_amp, color=(0, 0, 255), inset=80)
+                draw_overlay(frame, f"seq={latest_seq} rssi={latest_rssi} len={latest_len} fmt={latest_version}", 92)
+                draw_overlay(frame, "Press q to quit", 118)
+                canvas = frame
             else:
+                draw_wave_on_canvas(wave, fft_vals, color=(255, 255, 0), inset=20)
+                draw_wave_on_canvas(wave, latest_amp, color=(0, 0, 255), inset=20)
+                draw_overlay(wave, "Combined CSI Waves: RAW=Red FFT=Yellow", 26)
+                draw_overlay(wave, f"CSI seq: {latest_seq}", 52)
+                draw_overlay(wave, f"RSSI: {latest_rssi} dBm", 78)
+                draw_overlay(wave, f"Raw len: {latest_len}", 104)
+                draw_overlay(wave, f"Format: {latest_version}", 130)
+                draw_overlay(wave, "Press q to quit", 156)
                 canvas = wave
 
             now = time.time()
