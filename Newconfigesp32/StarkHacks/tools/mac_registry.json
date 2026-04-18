@@ -1,0 +1,10 @@
+{
+  "nodes": {
+    "3c:71:bf:4a:5e:14": "NODE-LEFT",
+    "3c:71:bf:4a:5e:15": "NODE-RIGHT",
+    "3c:71:bf:4a:5e:16": "NODE-BACK",
+    "3c:71:bf:4a:5e:17": "NODE-FRONT"
+  },
+  "auto_register": true,
+  "unknown_prefix": "NODE-UNKNOWN"
+}
