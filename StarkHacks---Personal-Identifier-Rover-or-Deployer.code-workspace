@@ -1,0 +1,20 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"name": "StarkHacks",
+			"path": "StarkHacks"
+		},
+		{
+			"name": "Rover",
+			"path": "../../../Documents/PlatformIO/Projects/Rover"
+		},
+		{
+			"name": "starkHacksRover",
+			"path": "StarkHacksRoverMod/starkHacksRover"
+		}
+	],
+	"settings": {}
+}
