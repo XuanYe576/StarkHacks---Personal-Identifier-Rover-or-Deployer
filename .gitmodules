@@ -1,9 +1,0 @@
-[submodule "third_party/ESPARGOS-WiFi-ChannelCharting"]
-	path = third_party/ESPARGOS-WiFi-ChannelCharting
-	url = https://github.com/Jeija/ESPARGOS-WiFi-ChannelCharting.git
-[submodule "third_party/espectre"]
-	path = third_party/espectre
-	url = https://github.com/francescopace/espectre.git
-[submodule "third_party/gr-ieee802-11"]
-	path = third_party/gr-ieee802-11
-	url = https://github.com/bastibl/gr-ieee802-11.git

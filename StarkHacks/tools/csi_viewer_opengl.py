@@ -56,6 +56,17 @@ def parse_args():
     )
     parser.add_argument("--camera-serial-port", default="", help="Optional serial plugin port for camera metadata")
     parser.add_argument("--camera-serial-baud", type=int, default=115200, help="Baud for camera serial plugin")
+    parser.add_argument("--csi-gaussian-overlay", action="store_true", help="Enable Gaussian CSI strength heat overlay")
+    parser.add_argument("--csi-gaussian-alpha", type=float, default=0.35, help="Gaussian overlay alpha (0.0 to 1.0)")
+    parser.add_argument("--csi-gaussian-sigma", type=float, default=20.0, help="Gaussian spread in pixels")
+    parser.add_argument("--antenna-pov-overlay", action="store_true", help="Enable camera-space Gaussian overlay from antenna POV")
+    parser.add_argument("--antenna-pov-alpha", type=float, default=0.35, help="Antenna POV overlay alpha (0.0 to 1.0)")
+    parser.add_argument("--antenna-center-x", type=float, default=0.75, help="Antenna origin x in normalized screen coordinates (0..1)")
+    parser.add_argument("--antenna-center-y", type=float, default=0.90, help="Antenna origin y in normalized screen coordinates (0..1)")
+    parser.add_argument("--antenna-azimuth-deg", type=float, default=-90.0, help="Main-lobe azimuth in degrees (0:right, 90:down, -90:up)")
+    parser.add_argument("--antenna-sigma-forward", type=float, default=320.0, help="Forward spread in pixels")
+    parser.add_argument("--antenna-sigma-lateral", type=float, default=120.0, help="Lateral spread in pixels")
+    parser.add_argument("--antenna-front-softness", type=float, default=80.0, help="Front-only gating softness in pixels")
     return parser.parse_args()
 
 
@@ -220,6 +231,118 @@ def draw_wave_on_canvas(canvas, amp_values, color=(0, 0, 255), inset=20):
     cv2.polylines(canvas, [pts], isClosed=False, color=color, thickness=2)
 
 
+def build_gaussian_strength_overlay(amp_values, width, height, inset=20, sigma=20.0):
+    overlay = np.zeros((height, width, 3), dtype=np.uint8)
+    if amp_values is None or len(amp_values) == 0:
+        return overlay
+
+    amp = np.array(amp_values, dtype=np.float32)
+    amp = np.clip(amp, 0.0, 255.0)
+    vmax = max(32.0, float(np.percentile(amp, 98)))
+    norm = np.clip(amp / vmax, 0.0, 1.0)
+    if norm.size == 0:
+        return overlay
+
+    n = norm.shape[0]
+    if n == 1:
+        x = np.array([width // 2], dtype=np.int32)
+    else:
+        x = np.linspace(0, width - 1, n).astype(np.int32)
+    y = (height - inset - (norm * (height - (2 * inset)))).astype(np.int32)
+    y = np.clip(y, 0, height - 1)
+
+    heat = np.zeros((height, width), dtype=np.float32)
+    for xi, yi, vi in zip(x, y, norm):
+        if vi <= 0.0:
+            continue
+        heat[yi, xi] = max(heat[yi, xi], vi)
+
+    sigma = max(1.0, float(sigma))
+    heat = cv2.GaussianBlur(heat, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    peak = float(np.max(heat))
+    if peak > 1e-6:
+        heat = heat / peak
+    heat_u8 = (heat * 255.0).astype(np.uint8)
+    overlay[:, :, 2] = heat_u8
+    overlay[:, :, 1] = (heat_u8 * 0.25).astype(np.uint8)
+    return overlay
+
+
+def draw_csi_layers(canvas, latest_amp, fft_vals, args, inset):
+    if args.csi_gaussian_overlay:
+        alpha = float(np.clip(args.csi_gaussian_alpha, 0.0, 1.0))
+        gauss = build_gaussian_strength_overlay(
+            latest_amp,
+            canvas.shape[1],
+            canvas.shape[0],
+            inset=inset,
+            sigma=args.csi_gaussian_sigma,
+        )
+        cv2.addWeighted(canvas, 1.0, gauss, alpha, 0.0, dst=canvas)
+    draw_wave_on_canvas(canvas, fft_vals, color=(255, 255, 0), inset=inset)
+    draw_wave_on_canvas(canvas, latest_amp, color=(0, 0, 255), inset=inset)
+
+
+def compute_csi_strength(amp_values, rssi_dbm):
+    if amp_values is None or len(amp_values) == 0:
+        return float(np.clip((rssi_dbm + 95.0) / 60.0, 0.0, 1.0))
+    amp = np.asarray(amp_values, dtype=np.float32)
+    amp = np.clip(amp, 0.0, 255.0)
+    if amp.size == 0:
+        return float(np.clip((rssi_dbm + 95.0) / 60.0, 0.0, 1.0))
+    p95 = max(24.0, float(np.percentile(amp, 95)))
+    level = float(np.mean(amp) / p95)
+    rssi_level = float(np.clip((rssi_dbm + 95.0) / 60.0, 0.0, 1.0))
+    return float(np.clip(0.8 * level + 0.2 * rssi_level, 0.0, 1.0))
+
+
+def build_antenna_pov_overlay(strength, width, height, args):
+    overlay = np.zeros((height, width, 3), dtype=np.uint8)
+    strength = float(np.clip(strength, 0.0, 1.0))
+    if strength <= 1e-4:
+        return overlay
+
+    cx = float(np.clip(args.antenna_center_x, 0.0, 1.0)) * (width - 1)
+    cy = float(np.clip(args.antenna_center_y, 0.0, 1.0)) * (height - 1)
+    theta = np.radians(float(args.antenna_azimuth_deg))
+    c = float(np.cos(theta))
+    s = float(np.sin(theta))
+
+    xs = np.arange(width, dtype=np.float32)
+    ys = np.arange(height, dtype=np.float32)
+    xx, yy = np.meshgrid(xs, ys)
+    dx = xx - cx
+    dy = yy - cy
+
+    # Rotate into antenna frame: u=forward axis, v=lateral axis.
+    u = (dx * c) + (dy * s)
+    v = (-dx * s) + (dy * c)
+
+    sigma_u = max(8.0, float(args.antenna_sigma_forward))
+    sigma_v = max(8.0, float(args.antenna_sigma_lateral))
+    front_soft = max(1.0, float(args.antenna_front_softness))
+
+    gauss = np.exp(-0.5 * ((u / sigma_u) ** 2 + (v / sigma_v) ** 2))
+    front_gate = 1.0 / (1.0 + np.exp(-u / front_soft))
+    heat = gauss * front_gate * strength * 2.0
+    heat = np.clip(heat, 0.0, 1.0)
+
+    heat_u8 = (heat * 255.0).astype(np.uint8)
+    overlay[:, :, 2] = heat_u8
+    overlay[:, :, 1] = (heat_u8 * 0.15).astype(np.uint8)
+    return overlay
+
+
+def draw_antenna_pov_overlay(canvas, strength, args):
+    if not args.antenna_pov_overlay:
+        return
+    alpha = float(np.clip(args.antenna_pov_alpha, 0.0, 1.0))
+    if alpha <= 0.0:
+        return
+    ov = build_antenna_pov_overlay(strength, canvas.shape[1], canvas.shape[0], args)
+    cv2.addWeighted(canvas, 1.0, ov, alpha, 0.0, dst=canvas)
+
+
 def fft_magnitude(values, out_bins):
     arr = np.asarray(values, dtype=np.float32)
     if arr.size == 0:
@@ -365,6 +488,7 @@ def main():
     cached_right_id = None
     missed_left = 0
     missed_right = 0
+    csi_strength_smoothed = 0.0
 
     window_name = "CSI OpenGL Viewer"
     try:
@@ -393,6 +517,8 @@ def main():
                     latest_cam_serial = cam_line
 
             fft_vals = fft_magnitude(latest_amp, args.bins)
+            csi_strength_raw = compute_csi_strength(latest_amp, latest_rssi)
+            csi_strength_smoothed = (0.85 * csi_strength_smoothed) + (0.15 * csi_strength_raw)
             wave = np.zeros((CANVAS_H, CANVAS_W, 3), dtype=np.uint8)
 
             if cam_left is not None and cam_right is not None:
@@ -464,12 +590,13 @@ def main():
                         distance_text = "z=N/A"
 
                     stereo_panel = render_stereo_panel(frame_l, frame_r, stereo_info[:54])
+                    draw_antenna_pov_overlay(stereo_panel, csi_strength_smoothed, args)
                     # Overlay CSI graph directly over [cam1][cam0] interface.
-                    draw_wave_on_canvas(stereo_panel, fft_vals, color=(255, 255, 0), inset=90)
-                    draw_wave_on_canvas(stereo_panel, latest_amp, color=(0, 0, 255), inset=90)
+                    draw_csi_layers(stereo_panel, latest_amp, fft_vals, args, inset=90)
                     status_lines = [
-                        "CSI overlay: RAW=Red FFT=Yellow",
+                        "CSI overlay: RAW=Red FFT=Yellow" + (" + Gaussian" if args.csi_gaussian_overlay else ""),
                         f"seq={latest_seq} rssi={latest_rssi} len={latest_len} fmt={latest_version}",
+                        f"csi_strength={csi_strength_smoothed:.2f}",
                         f"{disparity_text}  {distance_text}",
                         f"mode={stereo_info}",
                     ]
@@ -481,8 +608,7 @@ def main():
                 else:
                     fallback = np.zeros((CANVAS_H, CANVAS_W, 3), dtype=np.uint8)
                     draw_overlay(fallback, "Stereo camera read failed", 40)
-                    draw_wave_on_canvas(fallback, fft_vals, color=(255, 255, 0), inset=80)
-                    draw_wave_on_canvas(fallback, latest_amp, color=(0, 0, 255), inset=80)
+                    draw_csi_layers(fallback, latest_amp, fft_vals, args, inset=80)
                     canvas = fallback
             elif cam_left is not None:
                 ok, frame = cam_left.read()
@@ -494,15 +620,19 @@ def main():
                 else:
                     frame = np.zeros((CANVAS_H, CANVAS_W, 3), dtype=np.uint8)
                     draw_overlay(frame, "Webcam read failed", 40)
-                draw_wave_on_canvas(frame, fft_vals, color=(255, 255, 0), inset=80)
-                draw_wave_on_canvas(frame, latest_amp, color=(0, 0, 255), inset=80)
+                draw_antenna_pov_overlay(frame, csi_strength_smoothed, args)
+                draw_csi_layers(frame, latest_amp, fft_vals, args, inset=80)
                 draw_overlay(frame, f"seq={latest_seq} rssi={latest_rssi} len={latest_len} fmt={latest_version}", 92)
-                draw_overlay(frame, "Press q to quit", 118)
+                draw_overlay(frame, f"csi_strength={csi_strength_smoothed:.2f}", 118)
+                draw_overlay(frame, "Press q to quit", 144)
                 canvas = frame
             else:
-                draw_wave_on_canvas(wave, fft_vals, color=(255, 255, 0), inset=20)
-                draw_wave_on_canvas(wave, latest_amp, color=(0, 0, 255), inset=20)
-                draw_overlay(wave, "Combined CSI Waves: RAW=Red FFT=Yellow", 26)
+                draw_csi_layers(wave, latest_amp, fft_vals, args, inset=20)
+                draw_overlay(
+                    wave,
+                    "Combined CSI Waves: RAW=Red FFT=Yellow" + (" + Gaussian" if args.csi_gaussian_overlay else ""),
+                    26,
+                )
                 draw_overlay(wave, f"CSI seq: {latest_seq}", 52)
                 draw_overlay(wave, f"RSSI: {latest_rssi} dBm", 78)
                 draw_overlay(wave, f"Raw len: {latest_len}", 104)
