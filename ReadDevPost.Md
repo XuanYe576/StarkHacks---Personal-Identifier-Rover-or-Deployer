@@ -100,3 +100,33 @@ Algorithm priorities:
 We also plan VR-based operator association/visualization for intuitive interpretation of fused spatial data.
 
 Longer term, we aim to strengthen the vision-language reasoning layer, improve geometric localization, and evolve this prototype into a robust rescue and smart-city tracking platform suitable for larger-scale deployment.
+
+
+key: 
+
+# ===== 0) Go to repo root =====
+cd /Users/zhuowenfeng6626/Downloads/StarkHacks/StarkHacks---Personal-Identifier-Rover-or-Deployer
+
+# ===== 1) Enable YOLO env =====
+source .venv-yolo310/bin/activate
+
+# ===== 2) Install runtime deps (safe to re-run) =====
+python -m pip install -U pip
+python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+python -m pip install requests opencv-python scipy filterpy lap pyyaml tqdm matplotlib pillow seaborn pandas scikit-image
+python -m pip install "tensorflow-macos==2.16.2" "tensorflow-metal==1.2.0"
+
+# ===== 3) Flash both CSI nodes =====
+cd StarkHacks
+~/.platformio/penv/bin/pio run -e csi_node_a -t upload --upload-port /dev/cu.usbserial-1120
+~/.platformio/penv/bin/pio run -e csi_node_b -t upload --upload-port /dev/cu.usbserial-1130
+
+# ===== 4) Run 2-node + 1-camera fusion viewer =====
+cd ..
+python StarkHacks/tools/csi_viewer_opengl.py \
+  --port /dev/cu.usbserial-1120 --baud 921600 \
+  --port-b /dev/cu.usbserial-1130 --baud-b 921600 \
+  --webcam 0 --stereo-right 1 --stereo-detect \
+  --detector-backend yolo_deepsort \
+  --stereo-detect-interval 1 --stereo-max-missed 30 \
+  --fusion-enable --fusion-assoc-gate-deg 18 --fusion-csi-min 0.20
