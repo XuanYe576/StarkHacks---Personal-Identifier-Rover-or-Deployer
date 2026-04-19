@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import argparse
+import json
 from pathlib import Path
+import re
 import sys
 import time
 
@@ -12,6 +14,7 @@ CANVAS_W = 1280
 CANVAS_H = 720
 PANEL_W = CANVAS_W // 2
 PANEL_H = CANVAS_H
+MIKU_BLUE = (187, 197, 57)  # BGR for #39C5BB
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 YOLO_REPO = REPO_ROOT / "lib" / "YOLOv7-DeepSORT-Human-Tracking"
@@ -29,6 +32,10 @@ def parse_args():
     parser = argparse.ArgumentParser(description="ESP32 CSI viewer (OpenCV OpenGL window)")
     parser.add_argument("--port", required=True, help="Serial port (for example /dev/ttyACM0 or COM5)")
     parser.add_argument("--baud", type=int, default=921600, help="Serial baud rate")
+    parser.add_argument("--port-b", default="", help="Optional second CSI serial port")
+    parser.add_argument("--port-c", default="", help="Optional third CSI serial port")
+    parser.add_argument("--baud-b", type=int, default=921600, help="Second CSI serial baud")
+    parser.add_argument("--baud-c", type=int, default=921600, help="Third CSI serial baud")
     parser.add_argument("--bins", type=int, default=64, help="Number of CSI bins to display")
     parser.add_argument("--webcam", default="", help="Optional webcam index or path")
     parser.add_argument("--stereo-right", default="", help="Optional right camera index/path for stereo interface")
@@ -56,9 +63,14 @@ def parse_args():
     )
     parser.add_argument("--camera-serial-port", default="", help="Optional serial plugin port for camera metadata")
     parser.add_argument("--camera-serial-baud", type=int, default=115200, help="Baud for camera serial plugin")
+    parser.add_argument("--imu-serial-port", default="", help="Optional IMU serial port (ESP32 IMU stream)")
+    parser.add_argument("--imu-serial-baud", type=int, default=115200, help="Baud for IMU serial")
+    parser.add_argument("--imu-yaw-offset-deg", type=float, default=0.0, help="Yaw offset to align IMU and camera frame")
     parser.add_argument("--csi-gaussian-overlay", action="store_true", help="Enable Gaussian CSI strength heat overlay")
     parser.add_argument("--csi-gaussian-alpha", type=float, default=0.35, help="Gaussian overlay alpha (0.0 to 1.0)")
     parser.add_argument("--csi-gaussian-sigma", type=float, default=20.0, help="Gaussian spread in pixels")
+    parser.add_argument("--camera-fusion-generate", action="store_true", help="Generate CSI-camera fused heat layer")
+    parser.add_argument("--camera-fusion-alpha", type=float, default=0.42, help="CSI-camera fusion alpha (0.0 to 1.0)")
     parser.add_argument("--antenna-pov-overlay", action="store_true", help="Enable camera-space Gaussian overlay from antenna POV")
     parser.add_argument("--antenna-pov-alpha", type=float, default=0.35, help="Antenna POV overlay alpha (0.0 to 1.0)")
     parser.add_argument("--antenna-center-x", type=float, default=0.75, help="Antenna origin x in normalized screen coordinates (0..1)")
@@ -67,6 +79,17 @@ def parse_args():
     parser.add_argument("--antenna-sigma-forward", type=float, default=320.0, help="Forward spread in pixels")
     parser.add_argument("--antenna-sigma-lateral", type=float, default=120.0, help="Lateral spread in pixels")
     parser.add_argument("--antenna-front-softness", type=float, default=80.0, help="Front-only gating softness in pixels")
+    parser.add_argument("--presence-threshold", type=float, default=0.25, help="CSI strength threshold for presence color switch")
+    parser.add_argument("--fusion-enable", action="store_true", help="Enable WiFi+YOLO+IMU association")
+    parser.add_argument("--wifi-look-yaw-deg", type=float, default=0.0, help="Base WiFi look yaw (deg) if no servo/IMU source")
+    parser.add_argument("--fusion-assoc-gate-deg", type=float, default=18.0, help="Association gate in degrees")
+    parser.add_argument("--fusion-csi-min", type=float, default=0.20, help="Minimum CSI strength for association")
+    parser.add_argument("--trilateration-enable", action="store_true", help="Enable multi-ESP RSSI trilateration")
+    parser.add_argument("--anchor-a", default="0.0,0.0", help="Anchor A x,y in meters")
+    parser.add_argument("--anchor-b", default="1.0,0.0", help="Anchor B x,y in meters")
+    parser.add_argument("--anchor-c", default="0.0,1.0", help="Anchor C x,y in meters")
+    parser.add_argument("--rssi-ref-db", type=float, default=-40.0, help="RSSI at 1m for distance estimate")
+    parser.add_argument("--path-loss-exp", type=float, default=2.2, help="Path-loss exponent for distance estimate")
     return parser.parse_args()
 
 
@@ -164,12 +187,111 @@ def parse_csi_line(line):
     return None
 
 
-def draw_overlay(img, text, y):
-    cv2.putText(img, text, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+def parse_imu_line(line):
+    line = line.strip()
+    if not line:
+        return None
+
+    # CSV formats:
+    # IMU,yaw,pitch,roll
+    # YPR,yaw,pitch,roll
+    parts = line.split(",")
+    if len(parts) >= 4 and parts[0].upper() in ("IMU", "YPR"):
+        try:
+            yaw = float(parts[1])
+            pitch = float(parts[2])
+            roll = float(parts[3])
+            return {"yaw": yaw, "pitch": pitch, "roll": roll}
+        except ValueError:
+            pass
+
+    # JSON format: {"yaw":..,"pitch":..,"roll":..}
+    if line.startswith("{") and line.endswith("}"):
+        try:
+            obj = json.loads(line)
+            if "yaw" in obj:
+                return {
+                    "yaw": float(obj.get("yaw", 0.0)),
+                    "pitch": float(obj.get("pitch", 0.0)),
+                    "roll": float(obj.get("roll", 0.0)),
+                }
+        except Exception:
+            pass
+
+    # Key-value format: yaw=.. pitch=.. roll=..
+    m_yaw = re.search(r"yaw\s*=\s*(-?\d+(\.\d+)?)", line, flags=re.IGNORECASE)
+    if m_yaw:
+        m_pitch = re.search(r"pitch\s*=\s*(-?\d+(\.\d+)?)", line, flags=re.IGNORECASE)
+        m_roll = re.search(r"roll\s*=\s*(-?\d+(\.\d+)?)", line, flags=re.IGNORECASE)
+        return {
+            "yaw": float(m_yaw.group(1)),
+            "pitch": float(m_pitch.group(1)) if m_pitch else 0.0,
+            "roll": float(m_roll.group(1)) if m_roll else 0.0,
+        }
+    return None
+
+
+def wrap_deg(x):
+    return ((x + 180.0) % 360.0) - 180.0
+
+
+def angle_diff_deg(a, b):
+    return abs(wrap_deg(a - b))
+
+
+def bbox_yaw_deg(bbox, frame_w, hfov_deg):
+    if bbox is None or frame_w <= 0:
+        return None
+    x, _, w, _ = bbox
+    cx = x + 0.5 * w
+    nx = (cx / frame_w) - 0.5
+    return float(nx * hfov_deg)
+
+
+def parse_anchor_xy(s, fallback=(0.0, 0.0)):
+    try:
+        p = [float(x.strip()) for x in s.split(",")]
+        if len(p) == 2:
+            return (p[0], p[1])
+    except Exception:
+        pass
+    return fallback
+
+
+def rssi_to_distance_m(rssi_dbm, rssi_ref_db, path_loss_exp):
+    n = max(1e-3, float(path_loss_exp))
+    # Log-distance path loss model:
+    # d = 10 ^ ((RSSI_ref(1m) - RSSI) / (10*n))
+    d = 10.0 ** ((float(rssi_ref_db) - float(rssi_dbm)) / (10.0 * n))
+    return float(np.clip(d, 0.1, 50.0))
+
+
+def trilaterate_2d(a, b, c, da, db, dc):
+    # Linearized least-squares from three circles.
+    x1, y1 = a
+    x2, y2 = b
+    x3, y3 = c
+    A = np.array([
+        [2.0 * (x2 - x1), 2.0 * (y2 - y1)],
+        [2.0 * (x3 - x1), 2.0 * (y3 - y1)],
+    ], dtype=np.float64)
+    B = np.array([
+        (x2 * x2 + y2 * y2 - db * db) - (x1 * x1 + y1 * y1 - da * da),
+        (x3 * x3 + y3 * y3 - dc * dc) - (x1 * x1 + y1 * y1 - da * da),
+    ], dtype=np.float64)
+    try:
+        pos, *_ = np.linalg.lstsq(A, B, rcond=None)
+        return float(pos[0]), float(pos[1])
+    except Exception:
+        return None
+
+
+def draw_overlay(img, text, y, color=(255, 255, 255)):
+    cv2.putText(img, text, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
     cv2.putText(img, text, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 1, cv2.LINE_AA)
 
 
-def draw_status_box(img, lines, x=10, y=10, line_h=22):
+def draw_status_box(img, lines, x=10, y=10, line_h=22, text_color=(255, 255, 255), border_color=(60, 60, 60)):
     if not lines:
         return
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -184,10 +306,10 @@ def draw_status_box(img, lines, x=10, y=10, line_h=22):
     x2 = min(img.shape[1] - 1, x + box_w)
     y2 = min(img.shape[0] - 1, y + box_h)
     cv2.rectangle(img, (x, y), (x2, y2), (0, 0, 0), -1)
-    cv2.rectangle(img, (x, y), (x2, y2), (60, 60, 60), 1)
+    cv2.rectangle(img, (x, y), (x2, y2), border_color, 1)
     for i, ln in enumerate(lines):
         yy = y + 20 + i * line_h
-        cv2.putText(img, ln, (x + 8, yy), font, scale, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(img, ln, (x + 8, yy), font, scale, text_color, 2, cv2.LINE_AA)
         cv2.putText(img, ln, (x + 8, yy), font, scale, (20, 20, 20), 1, cv2.LINE_AA)
 
 
@@ -281,6 +403,25 @@ def draw_csi_layers(canvas, latest_amp, fft_vals, args, inset):
         cv2.addWeighted(canvas, 1.0, gauss, alpha, 0.0, dst=canvas)
     draw_wave_on_canvas(canvas, fft_vals, color=(255, 255, 0), inset=inset)
     draw_wave_on_canvas(canvas, latest_amp, color=(0, 0, 255), inset=inset)
+
+
+def draw_camera_fusion_layer(canvas, latest_amp, csi_strength, args, inset=80):
+    if not args.camera_fusion_generate:
+        return
+    alpha = float(np.clip(args.camera_fusion_alpha, 0.0, 1.0))
+    if alpha <= 0.0:
+        return
+    # Two cues fused: per-bin Gaussian field + antenna POV field weighted by CSI strength.
+    gauss = build_gaussian_strength_overlay(
+        latest_amp,
+        canvas.shape[1],
+        canvas.shape[0],
+        inset=inset,
+        sigma=args.csi_gaussian_sigma,
+    )
+    pov = build_antenna_pov_overlay(csi_strength, canvas.shape[1], canvas.shape[0], args)
+    fused = cv2.addWeighted(gauss, 0.55, pov, 0.45, 0.0)
+    cv2.addWeighted(canvas, 1.0, fused, alpha, 0.0, dst=canvas)
 
 
 def compute_csi_strength(amp_values, rssi_dbm):
@@ -435,7 +576,24 @@ def main():
     args.stereo_detect_interval = max(1, args.stereo_detect_interval)
     args.stereo_max_missed = max(1, args.stereo_max_missed)
 
-    ser = serial.Serial(args.port, args.baud, timeout=0.03)
+    def _open_serial_or_warn(port, baud, timeout=0.03, label="serial"):
+        if not port:
+            return None
+        try:
+            return serial.Serial(port, baud, timeout=timeout)
+        except Exception as exc:
+            print(f"[WARN] {label} disabled: {exc}")
+            return None
+
+    ser = _open_serial_or_warn(args.port, args.baud, timeout=0.03, label="CSI A serial")
+    if ser is None:
+        raise RuntimeError("Primary CSI serial port is required and failed to open.")
+    ser_b = _open_serial_or_warn(args.port_b, args.baud_b, timeout=0.0, label="CSI B serial")
+    ser_c = _open_serial_or_warn(args.port_c, args.baud_c, timeout=0.0, label="CSI C serial")
+
+    anchor_a = parse_anchor_xy(args.anchor_a, fallback=(0.0, 0.0))
+    anchor_b = parse_anchor_xy(args.anchor_b, fallback=(1.0, 0.0))
+    anchor_c = parse_anchor_xy(args.anchor_c, fallback=(0.0, 1.0))
     cam_left = open_camera(args.webcam)
     cam_right = open_camera(args.stereo_right) if args.stereo_right else None
     hog = None
@@ -468,6 +626,13 @@ def main():
         except Exception as exc:
             print(f"[WARN] camera serial plugin disabled: {exc}")
             camera_serial = None
+    imu_serial = None
+    if args.imu_serial_port:
+        try:
+            imu_serial = serial.Serial(args.imu_serial_port, args.imu_serial_baud, timeout=0.0)
+        except Exception as exc:
+            print(f"[WARN] IMU serial disabled: {exc}")
+            imu_serial = None
 
     latest_seq = 0
     latest_rssi = -127
@@ -489,6 +654,19 @@ def main():
     missed_left = 0
     missed_right = 0
     csi_strength_smoothed = 0.0
+    csi_strength_smoothed_b = 0.0
+    csi_strength_smoothed_c = 0.0
+    latest_rssi_b = -127
+    latest_rssi_c = -127
+    seen_b = False
+    seen_c = False
+    trilat_xy = None
+    trilat_d = (0.0, 0.0, 0.0)
+    latest_imu = {"yaw": 0.0, "pitch": 0.0, "roll": 0.0}
+    fused_assoc = False
+    fused_assoc_err = 999.0
+    fused_wifi_yaw = 0.0
+    fused_yolo_yaw = 0.0
 
     window_name = "CSI OpenGL Viewer"
     try:
@@ -511,14 +689,46 @@ def main():
                     amp = np.clip(amp, 0.0, 255.0)
                     latest_amp[: amp.shape[0]] = amp.astype(np.uint8)
 
+            if ser_b is not None:
+                line_b = ser_b.readline().decode("utf-8", errors="ignore").strip()
+                parsed_b = parse_csi_line(line_b) if line_b else None
+                if parsed_b is not None:
+                    latest_rssi_b = parsed_b["rssi"]
+                    seen_b = True
+            if ser_c is not None:
+                line_c = ser_c.readline().decode("utf-8", errors="ignore").strip()
+                parsed_c = parse_csi_line(line_c) if line_c else None
+                if parsed_c is not None:
+                    latest_rssi_c = parsed_c["rssi"]
+                    seen_c = True
+
             if camera_serial is not None:
                 cam_line = camera_serial.readline().decode("utf-8", errors="ignore").strip()
                 if cam_line:
                     latest_cam_serial = cam_line
+            if imu_serial is not None:
+                imu_line = imu_serial.readline().decode("utf-8", errors="ignore").strip()
+                parsed_imu = parse_imu_line(imu_line) if imu_line else None
+                if parsed_imu is not None:
+                    latest_imu = parsed_imu
 
             fft_vals = fft_magnitude(latest_amp, args.bins)
             csi_strength_raw = compute_csi_strength(latest_amp, latest_rssi)
             csi_strength_smoothed = (0.85 * csi_strength_smoothed) + (0.15 * csi_strength_raw)
+            if seen_b:
+                csi_strength_smoothed_b = (0.85 * csi_strength_smoothed_b) + (0.15 * float(np.clip((latest_rssi_b + 95.0) / 60.0, 0.0, 1.0)))
+            if seen_c:
+                csi_strength_smoothed_c = (0.85 * csi_strength_smoothed_c) + (0.15 * float(np.clip((latest_rssi_c + 95.0) / 60.0, 0.0, 1.0)))
+
+            csi_max_strength = max(csi_strength_smoothed, csi_strength_smoothed_b, csi_strength_smoothed_c)
+            wifi_present = csi_max_strength >= float(args.presence_threshold)
+
+            if args.trilateration_enable and seen_b and seen_c:
+                d_a = rssi_to_distance_m(latest_rssi, args.rssi_ref_db, args.path_loss_exp)
+                d_b = rssi_to_distance_m(latest_rssi_b, args.rssi_ref_db, args.path_loss_exp)
+                d_c = rssi_to_distance_m(latest_rssi_c, args.rssi_ref_db, args.path_loss_exp)
+                trilat_d = (d_a, d_b, d_c)
+                trilat_xy = trilaterate_2d(anchor_a, anchor_b, anchor_c, d_a, d_b, d_c)
             wave = np.zeros((CANVAS_H, CANVAS_W, 3), dtype=np.uint8)
 
             if cam_left is not None and cam_right is not None:
@@ -558,16 +768,21 @@ def main():
                                 cached_right_box = None
                                 cached_right_id = None
 
+                    human_present = (cached_left_box is not None) or (cached_right_box is not None)
+                    presence_on = wifi_present or human_present
+                    accent_color = MIKU_BLUE if presence_on else (255, 255, 255)
+                    box_color = MIKU_BLUE if presence_on else (0, 255, 255)
+
                     if cached_left_box is not None:
                         x, y, w, h = cached_left_box
-                        cv2.rectangle(frame_l, (x, y), (x + w, y + h), (0, 255, 255), 2)
+                        cv2.rectangle(frame_l, (x, y), (x + w, y + h), box_color, 2)
                         if cached_left_id is not None and cached_left_id >= 0:
-                            cv2.putText(frame_l, f"ID {cached_left_id}", (x, max(20, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA)
+                            cv2.putText(frame_l, f"ID {cached_left_id}", (x, max(20, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, box_color, 2, cv2.LINE_AA)
                     if cached_right_box is not None:
                         x, y, w, h = cached_right_box
-                        cv2.rectangle(frame_r, (x, y), (x + w, y + h), (0, 255, 255), 2)
+                        cv2.rectangle(frame_r, (x, y), (x + w, y + h), box_color, 2)
                         if cached_right_id is not None and cached_right_id >= 0:
-                            cv2.putText(frame_r, f"ID {cached_right_id}", (x, max(20, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA)
+                            cv2.putText(frame_r, f"ID {cached_right_id}", (x, max(20, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, box_color, 2, cv2.LINE_AA)
 
                     stereo_info = f"stereo {args.detector_backend}"
                     if cached_left_box is not None and cached_right_box is not None:
@@ -589,21 +804,52 @@ def main():
                         disparity_text = "d=N/A"
                         distance_text = "z=N/A"
 
+                    fused_assoc = False
+                    fused_assoc_err = 999.0
+                    fused_wifi_yaw = wrap_deg(
+                        float(args.wifi_look_yaw_deg)
+                        + float(args.imu_yaw_offset_deg)
+                        + float(latest_imu["yaw"])
+                    )
+                    yolo_yaw = bbox_yaw_deg(cached_left_box, frame_l.shape[1], float(args.stereo_hfov_deg))
+                    if yolo_yaw is None:
+                        yolo_yaw = bbox_yaw_deg(cached_right_box, frame_r.shape[1], float(args.stereo_hfov_deg))
+                    if yolo_yaw is not None:
+                        fused_yolo_yaw = yolo_yaw
+                        fused_assoc_err = angle_diff_deg(fused_wifi_yaw, yolo_yaw)
+                        if args.fusion_enable and csi_strength_smoothed >= float(args.fusion_csi_min):
+                            fused_assoc = fused_assoc_err <= float(args.fusion_assoc_gate_deg)
+
                     stereo_panel = render_stereo_panel(frame_l, frame_r, stereo_info[:54])
+                    draw_camera_fusion_layer(stereo_panel, latest_amp, csi_strength_smoothed, args, inset=90)
                     draw_antenna_pov_overlay(stereo_panel, csi_strength_smoothed, args)
                     # Overlay CSI graph directly over [cam1][cam0] interface.
                     draw_csi_layers(stereo_panel, latest_amp, fft_vals, args, inset=90)
                     status_lines = [
                         "CSI overlay: RAW=Red FFT=Yellow" + (" + Gaussian" if args.csi_gaussian_overlay else ""),
                         f"seq={latest_seq} rssi={latest_rssi} len={latest_len} fmt={latest_version}",
-                        f"csi_strength={csi_strength_smoothed:.2f}",
+                        f"csi_strength(a,b,c)=({csi_strength_smoothed:.2f},{csi_strength_smoothed_b:.2f},{csi_strength_smoothed_c:.2f})",
+                        f"presence={'ON' if presence_on else 'OFF'}",
+                        f"imu(ypr)=({latest_imu['yaw']:.1f},{latest_imu['pitch']:.1f},{latest_imu['roll']:.1f})",
+                        f"fusion={'ON' if args.fusion_enable else 'OFF'} assoc={'YES' if fused_assoc else 'NO'} err={fused_assoc_err:.1f}deg",
                         f"{disparity_text}  {distance_text}",
                         f"mode={stereo_info}",
+                        f"camera_fusion={'ON' if args.camera_fusion_generate else 'OFF'} alpha={float(args.camera_fusion_alpha):.2f}",
                     ]
+                    if args.trilateration_enable:
+                        if trilat_xy is not None:
+                            status_lines.append(f"trilat_xy=({trilat_xy[0]:.2f},{trilat_xy[1]:.2f})m d=({trilat_d[0]:.2f},{trilat_d[1]:.2f},{trilat_d[2]:.2f})m")
+                        else:
+                            status_lines.append("trilat_xy=N/A (need 3 CSI nodes: A+B+C)")
                     if camera_serial is not None:
                         status_lines.append(f"serial={latest_cam_serial[:64]}")
                     status_lines.append("Press q to quit")
-                    draw_status_box(stereo_panel, status_lines, x=10, y=34, line_h=22)
+                    draw_status_box(stereo_panel, status_lines, x=10, y=34, line_h=22, text_color=accent_color, border_color=accent_color)
+                    if presence_on:
+                        cv2.rectangle(stereo_panel, (0, 0), (stereo_panel.shape[1] - 1, stereo_panel.shape[0] - 1), MIKU_BLUE, 2)
+                    if fused_assoc:
+                        cv2.putText(stereo_panel, "WIFI<->YOLO ASSOCIATED", (PANEL_W - 145, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, MIKU_BLUE, 2, cv2.LINE_AA)
+                        cv2.putText(stereo_panel, "WIFI<->YOLO ASSOCIATED", (PANEL_W - 145, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 1, cv2.LINE_AA)
                     canvas = stereo_panel
                 else:
                     fallback = np.zeros((CANVAS_H, CANVAS_W, 3), dtype=np.uint8)
@@ -620,24 +866,46 @@ def main():
                 else:
                     frame = np.zeros((CANVAS_H, CANVAS_W, 3), dtype=np.uint8)
                     draw_overlay(frame, "Webcam read failed", 40)
+                presence_on = wifi_present
+                accent_color = MIKU_BLUE if presence_on else (255, 255, 255)
+                draw_camera_fusion_layer(frame, latest_amp, csi_strength_smoothed, args, inset=80)
                 draw_antenna_pov_overlay(frame, csi_strength_smoothed, args)
                 draw_csi_layers(frame, latest_amp, fft_vals, args, inset=80)
-                draw_overlay(frame, f"seq={latest_seq} rssi={latest_rssi} len={latest_len} fmt={latest_version}", 92)
-                draw_overlay(frame, f"csi_strength={csi_strength_smoothed:.2f}", 118)
-                draw_overlay(frame, "Press q to quit", 144)
+                draw_overlay(frame, f"seq={latest_seq} rssi={latest_rssi} len={latest_len} fmt={latest_version}", 92, color=accent_color)
+                draw_overlay(frame, f"csi_strength(a,b,c)=({csi_strength_smoothed:.2f},{csi_strength_smoothed_b:.2f},{csi_strength_smoothed_c:.2f}) presence={'ON' if presence_on else 'OFF'}", 118, color=accent_color)
+                draw_overlay(frame, f"imu_yaw={latest_imu['yaw']:.1f} fusion={'ON' if args.fusion_enable else 'OFF'}", 144, color=accent_color)
+                if args.trilateration_enable and trilat_xy is not None:
+                    draw_overlay(frame, f"trilat_xy=({trilat_xy[0]:.2f},{trilat_xy[1]:.2f})m", 170, color=accent_color)
+                    draw_overlay(frame, "Press q to quit", 196, color=accent_color)
+                else:
+                    draw_overlay(frame, "Press q to quit", 170, color=accent_color)
+                if presence_on:
+                    cv2.rectangle(frame, (0, 0), (frame.shape[1] - 1, frame.shape[0] - 1), MIKU_BLUE, 2)
                 canvas = frame
             else:
+                presence_on = wifi_present
+                accent_color = MIKU_BLUE if presence_on else (255, 255, 255)
                 draw_csi_layers(wave, latest_amp, fft_vals, args, inset=20)
                 draw_overlay(
                     wave,
                     "Combined CSI Waves: RAW=Red FFT=Yellow" + (" + Gaussian" if args.csi_gaussian_overlay else ""),
                     26,
+                    color=accent_color,
                 )
-                draw_overlay(wave, f"CSI seq: {latest_seq}", 52)
-                draw_overlay(wave, f"RSSI: {latest_rssi} dBm", 78)
-                draw_overlay(wave, f"Raw len: {latest_len}", 104)
-                draw_overlay(wave, f"Format: {latest_version}", 130)
-                draw_overlay(wave, "Press q to quit", 156)
+                draw_overlay(wave, f"CSI seq: {latest_seq}", 52, color=accent_color)
+                draw_overlay(wave, f"RSSI: {latest_rssi} dBm", 78, color=accent_color)
+                draw_overlay(wave, f"Raw len: {latest_len}", 104, color=accent_color)
+                draw_overlay(wave, f"Format: {latest_version}", 130, color=accent_color)
+                draw_overlay(wave, f"RSSI(b,c)=({latest_rssi_b},{latest_rssi_c}) dBm", 156, color=accent_color)
+                if args.trilateration_enable and trilat_xy is not None:
+                    draw_overlay(wave, f"Trilat XY: ({trilat_xy[0]:.2f},{trilat_xy[1]:.2f})m", 182, color=accent_color)
+                    draw_overlay(wave, f"Presence: {'ON' if presence_on else 'OFF'}", 208, color=accent_color)
+                    draw_overlay(wave, "Press q to quit", 234, color=accent_color)
+                else:
+                    draw_overlay(wave, f"Presence: {'ON' if presence_on else 'OFF'}", 182, color=accent_color)
+                    draw_overlay(wave, "Press q to quit", 208, color=accent_color)
+                if presence_on:
+                    cv2.rectangle(wave, (0, 0), (wave.shape[1] - 1, wave.shape[0] - 1), MIKU_BLUE, 2)
                 canvas = wave
 
             now = time.time()
@@ -660,8 +928,14 @@ def main():
                 break
     finally:
         ser.close()
+        if ser_b is not None:
+            ser_b.close()
+        if ser_c is not None:
+            ser_c.close()
         if camera_serial is not None:
             camera_serial.close()
+        if imu_serial is not None:
+            imu_serial.close()
         if cam_left is not None:
             cam_left.release()
         if cam_right is not None:

@@ -1,8 +1,10 @@
 // ESP32 Rover Controller (SoftAP + UDP)
 // Packet format (CSV):
-//   vx,vy,wz,s1,s2,s3,s4,en
+//   vx,vy,wz,elev,en           (recommended; single elevation servo)
+//   vx,vy,wz,s2,s3,s4,en       (legacy accepted; s2 used as elevation)
+//   vx,vy,wz,s1,s2,s3,s4,en    (legacy accepted; s1 ignored, s2 used)
 // Example:
-//   0.40,0.00,-0.20,90,90,90,90,1
+//   0.40,0.00,-0.20,95,1
 // Also supports single-token keyboard commands over UDP:
 //   W A S D Q E X
 //   W/S: forward/backward, A/D: strafe, Q/E: rotate, X: stop
@@ -10,7 +12,7 @@
 // vx: forward/backward   [-1..1]
 // vy: strafe left/right  [-1..1]
 // wz: yaw rotate         [-1..1]
-// sN: servo angle        [0..180]
+// elev: elevation servo angle [0..180]
 // en: 0/1 enable motors
 
 #include <ctype.h>
@@ -51,8 +53,9 @@
 #define MOTOR_PWM_MAX ((1 << 10) - 1)
 
 #define SERVO_PWM_FREQ_HZ 50
-#define SERVO_PWM_RES LEDC_TIMER_16_BIT
-#define SERVO_PWM_MAX ((1 << 16) - 1)
+// adafruit_qtpy_esp32s3_n4r2 (ESP-IDF in your setup) supports up to 14-bit LEDC.
+#define SERVO_PWM_RES LEDC_TIMER_14_BIT
+#define SERVO_PWM_MAX ((1 << 14) - 1)
 
 // Servo pulse width mapping (typical)
 #define SERVO_MIN_US 500
@@ -66,19 +69,22 @@ static const int MOTOR_IN1[4] = {4, 6, 8, 10};
 static const int MOTOR_IN2[4] = {5, 7, 9, 11};
 static const int MOTOR_PWM_PIN[4] = {12, 13, 14, 15};
 
-// 4 servos
-static const int SERVO_PIN[4] = {16, 17, 18, 21};
+// Single optional elevation servo. Set to -1 to fully disable servo output.
+static const int ELEVATION_SERVO_PIN = 17;
+
+// TB6612 STBY pins (optional). Set -1 if STBY is tied high in hardware.
+static const int TB6612_FRONT_STBY_PIN = -1;
+static const int TB6612_REAR_STBY_PIN = -1;
 
 static const ledc_channel_t MOTOR_PWM_CH[4] = {
     LEDC_CHANNEL_0, LEDC_CHANNEL_1, LEDC_CHANNEL_2, LEDC_CHANNEL_3};
-static const ledc_channel_t SERVO_PWM_CH[4] = {
-    LEDC_CHANNEL_4, LEDC_CHANNEL_5, LEDC_CHANNEL_6, LEDC_CHANNEL_7};
+static const ledc_channel_t ELEVATION_SERVO_PWM_CH = LEDC_CHANNEL_4;
 
 typedef struct {
     float vx;
     float vy;
     float wz;
-    int servo_deg[4];
+    int elevation_deg;
     int enable;
     int64_t last_rx_us;
 } control_state_t;
@@ -89,7 +95,7 @@ static control_state_t g_ctrl = {
     .vx = 0.0f,
     .vy = 0.0f,
     .wz = 0.0f,
-    .servo_deg = {90, 90, 90, 90},
+    .elevation_deg = 90,
     .enable = 0,
     .last_rx_us = 0,
 };
@@ -134,12 +140,11 @@ static void set_motor(int idx, float cmd) {
     ledc_update_duty(LEDC_LOW_SPEED_MODE, MOTOR_PWM_CH[idx]);
 }
 
-static void set_servo(int idx, int deg) {
-    int pin = SERVO_PIN[idx];
-    if (pin < 0) return;
+static void set_elevation_servo(int deg) {
+    if (ELEVATION_SERVO_PIN < 0) return;
     uint32_t duty = servo_deg_to_duty(deg);
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, SERVO_PWM_CH[idx], duty);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, SERVO_PWM_CH[idx]);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, ELEVATION_SERVO_PWM_CH, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, ELEVATION_SERVO_PWM_CH);
 }
 
 static void stop_all_motors(void) {
@@ -220,19 +225,28 @@ static void init_pwm_and_gpio(void) {
         }
     }
 
-    for (int i = 0; i < 4; i++) {
-        if (SERVO_PIN[i] >= 0) {
-            ledc_channel_config_t ch = {
-                .gpio_num = SERVO_PIN[i],
-                .speed_mode = LEDC_LOW_SPEED_MODE,
-                .channel = SERVO_PWM_CH[i],
-                .intr_type = LEDC_INTR_DISABLE,
-                .timer_sel = LEDC_TIMER_1,
-                .duty = servo_deg_to_duty(90),
-                .hpoint = 0,
-            };
-            ledc_channel_config(&ch);
-        }
+    if (ELEVATION_SERVO_PIN >= 0) {
+        ledc_channel_config_t ch = {
+            .gpio_num = ELEVATION_SERVO_PIN,
+            .speed_mode = LEDC_LOW_SPEED_MODE,
+            .channel = ELEVATION_SERVO_PWM_CH,
+            .intr_type = LEDC_INTR_DISABLE,
+            .timer_sel = LEDC_TIMER_1,
+            .duty = servo_deg_to_duty(90),
+            .hpoint = 0,
+        };
+        ledc_channel_config(&ch);
+    }
+
+    if (TB6612_FRONT_STBY_PIN >= 0) {
+        gpio_reset_pin((gpio_num_t)TB6612_FRONT_STBY_PIN);
+        gpio_set_direction((gpio_num_t)TB6612_FRONT_STBY_PIN, GPIO_MODE_OUTPUT);
+        gpio_set_level((gpio_num_t)TB6612_FRONT_STBY_PIN, 1);
+    }
+    if (TB6612_REAR_STBY_PIN >= 0) {
+        gpio_reset_pin((gpio_num_t)TB6612_REAR_STBY_PIN);
+        gpio_set_direction((gpio_num_t)TB6612_REAR_STBY_PIN, GPIO_MODE_OUTPUT);
+        gpio_set_level((gpio_num_t)TB6612_REAR_STBY_PIN, 1);
     }
 }
 
@@ -264,19 +278,43 @@ static void wifi_init_softap(void) {
 
 static int parse_csv_command(const char *line, control_state_t *out) {
     float vx, vy, wz;
-    int s1, s2, s3, s4, en;
-    int matched = sscanf(line, " %f , %f , %f , %d , %d , %d , %d , %d",
-                         &vx, &vy, &wz, &s1, &s2, &s3, &s4, &en);
-    if (matched != 8) return 0;
+    int elev, en;
+    int matched = sscanf(line, " %f , %f , %f , %d , %d", &vx, &vy, &wz, &elev, &en);
+    if (matched == 5) {
+        out->vx = clampf(vx, -1.0f, 1.0f);
+        out->vy = clampf(vy, -1.0f, 1.0f);
+        out->wz = clampf(wz, -1.0f, 1.0f);
+        out->elevation_deg = clampi(elev, 0, 180);
+        out->enable = (en != 0) ? 1 : 0;
+        out->last_rx_us = esp_timer_get_time();
+        return 1;
+    }
+
+    int s1, s2, s3, s4;
+    matched = sscanf(line, " %f , %f , %f , %d , %d , %d , %d , %d",
+                     &vx, &vy, &wz, &s1, &s2, &s3, &s4, &en);
+    if (matched == 8) {
+        out->vx = clampf(vx, -1.0f, 1.0f);
+        out->vy = clampf(vy, -1.0f, 1.0f);
+        out->wz = clampf(wz, -1.0f, 1.0f);
+        // Keep backward compatibility: use s2 as elevation.
+        out->elevation_deg = clampi(s2, 0, 180);
+        out->enable = (en != 0) ? 1 : 0;
+        out->last_rx_us = esp_timer_get_time();
+        return 1;
+    }
+
+    // Legacy compact format: vx,vy,wz,s2,s3,s4,en
+    int n2, n3, n4, nen;
+    matched = sscanf(line, " %f , %f , %f , %d , %d , %d , %d",
+                     &vx, &vy, &wz, &n2, &n3, &n4, &nen);
+    if (matched != 7) return 0;
 
     out->vx = clampf(vx, -1.0f, 1.0f);
     out->vy = clampf(vy, -1.0f, 1.0f);
     out->wz = clampf(wz, -1.0f, 1.0f);
-    out->servo_deg[0] = clampi(s1, 0, 180);
-    out->servo_deg[1] = clampi(s2, 0, 180);
-    out->servo_deg[2] = clampi(s3, 0, 180);
-    out->servo_deg[3] = clampi(s4, 0, 180);
-    out->enable = (en != 0) ? 1 : 0;
+    out->elevation_deg = clampi(n2, 0, 180);
+    out->enable = (nen != 0) ? 1 : 0;
     out->last_rx_us = esp_timer_get_time();
     return 1;
 }
@@ -381,9 +419,7 @@ static void control_task(void *arg) {
         }
 
         apply_mecanum(&local);
-        for (int i = 0; i < 4; i++) {
-            set_servo(i, local.servo_deg[i]);
-        }
+        set_elevation_servo(local.elevation_deg);
 
         vTaskDelay(pdMS_TO_TICKS(CONTROL_LOOP_MS));
     }
