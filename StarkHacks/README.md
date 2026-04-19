@@ -152,6 +152,43 @@ Notes:
   - VLM process -> consumes image + prompt for semantic output
 - Do not run VLM on ESP32; it is host-side only.
 
+### Rescue-oriented VLM return format
+
+For rescue use-cases, force structured JSON output so your controller can parse it safely.
+
+Expected JSON schema:
+
+```json
+{
+  "scene_summary": "short plain-language summary",
+  "risk_level": "low|medium|high|critical",
+  "hazards": {
+    "smoke_detected": false,
+    "fire_visible": false,
+    "low_visibility": false
+  },
+  "human_detected": true,
+  "human_count_est": 1,
+  "ppe_observed": {
+    "glasses_or_goggles": false,
+    "mask_or_respirator": false,
+    "helmet": false
+  },
+  "possible_overwall_presence": true,
+  "recommended_action": "continue_scan|approach_cautiously|hold_position|request_human_operator|trigger_rescue_protocol",
+  "confidence": 0.0,
+  "evidence": [
+    "why this decision was made"
+  ]
+}
+```
+
+Notes:
+- Keep `confidence` in `[0,1]`.
+- If uncertain, choose safer action (`request_human_operator` or `hold_position`).
+- If smoke/low-visibility cues are present, bias toward conservative actions.
+- You can use `tools/vlm_rescue_prompt.txt` as the system/task prompt template.
+
 ## WiFi + YOLO + IMU sensor fusion
 
 `tools/csi_viewer_opengl.py` now supports association between:
