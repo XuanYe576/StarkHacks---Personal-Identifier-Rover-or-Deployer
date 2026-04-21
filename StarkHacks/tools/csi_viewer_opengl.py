@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import argparse
+from collections import deque
 import json
+import math
 from pathlib import Path
 import re
 import sys
@@ -18,6 +20,8 @@ MIKU_BLUE = (187, 197, 57)  # BGR for #39C5BB
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 YOLO_REPO = REPO_ROOT / "lib" / "YOLOv7-DeepSORT-Human-Tracking"
+WIFICAM_ROOT = REPO_ROOT / "third_party" / "wificam"
+DEFAULT_WIFICAM_CKPT = WIFICAM_ROOT / "runs" / "mopoevae_ct" / "bestLoss.ckpt"
 
 
 def camera_backends():
@@ -90,6 +94,19 @@ def parse_args():
     parser.add_argument("--anchor-c", default="0.0,1.0", help="Anchor C x,y in meters")
     parser.add_argument("--rssi-ref-db", type=float, default=-40.0, help="RSSI at 1m for distance estimate")
     parser.add_argument("--path-loss-exp", type=float, default=2.2, help="Path-loss exponent for distance estimate")
+    parser.add_argument("--phase-coherence-enable", action="store_true", help="Enable multi-node differential phase coherence metric")
+    parser.add_argument("--phase-window-ms", type=float, default=500.0, help="Phase coherence segment window in milliseconds")
+    parser.add_argument("--phase-gaussian-sigma-ms", type=float, default=160.0, help="Gaussian temporal smoothing sigma in milliseconds")
+    parser.add_argument("--phase-min-samples", type=int, default=6, help="Minimum per-node CSI samples for phase coherence")
+    parser.add_argument("--thru-wall-recon-enable", action="store_true", help="Enable live WiFiCam through-wall reconstruction panel")
+    parser.add_argument("--thru-wall-fusion", default="mean", choices=["mean", "diff", "interleave"], help="Fusion mode for multi-node reconstruction")
+    parser.add_argument("--thru-wall-window-size", type=int, default=151, help="CSI packet window used by WiFiCam reconstruction")
+    parser.add_argument("--thru-wall-subcarriers", type=int, default=52, help="CSI feature width used by WiFiCam reconstruction")
+    parser.add_argument("--thru-wall-infer-every", type=int, default=3, help="Run reconstruction every N viewer frames")
+    parser.add_argument("--thru-wall-zdim", type=int, default=128, help="WiFiCam latent size")
+    parser.add_argument("--thru-wall-aggregate", default="concat", choices=["concat", "gaussian", "uniform"], help="WiFiCam latent aggregation mode")
+    parser.add_argument("--thru-wall-checkpoint", default=str(DEFAULT_WIFICAM_CKPT), help="WiFiCam checkpoint path")
+    parser.add_argument("--thru-wall-device", default="cpu", help="Device for reconstruction model, e.g. cpu or cuda")
     return parser.parse_args()
 
 
@@ -239,6 +256,10 @@ def angle_diff_deg(a, b):
     return abs(wrap_deg(a - b))
 
 
+def wrap_rad(x):
+    return ((x + np.pi) % (2.0 * np.pi)) - np.pi
+
+
 def bbox_yaw_deg(bbox, frame_w, hfov_deg):
     if bbox is None or frame_w <= 0:
         return None
@@ -284,6 +305,192 @@ def trilaterate_2d(a, b, c, da, db, dc):
         return float(pos[0]), float(pos[1])
     except Exception:
         return None
+
+
+def encode_time(x, levels, window_size):
+    window_size = max(1.0, float(window_size) * 3.0)
+    frequencies = np.array([2 ** i for i in range(levels)], dtype=np.float32)
+    x = np.asarray(x, dtype=np.float32) / window_size
+    return np.concatenate(
+        [
+            np.sin(frequencies[:, None] * np.pi * x),
+            np.cos(frequencies[:, None] * np.pi * x),
+        ],
+        axis=0,
+    )
+
+
+def to_model_subcarriers(amp_vec, n_sub=52):
+    x = np.asarray(amp_vec, dtype=np.float32)
+    if x.size >= n_sub:
+        start = (x.size - n_sub) // 2
+        return x[start : start + n_sub]
+    out = np.zeros((n_sub,), dtype=np.float32)
+    out[: x.size] = x
+    return out
+
+
+def build_spectrogram_heatmap(window_mat, out_w=220, out_h=120):
+    if window_mat is None or window_mat.size == 0:
+        return np.zeros((out_h, out_w, 3), dtype=np.uint8)
+    m = window_mat.astype(np.float32).copy()
+    lo = float(np.percentile(m, 2))
+    hi = float(np.percentile(m, 98))
+    if hi <= lo:
+        hi = lo + 1.0
+    m = np.clip((m - lo) / (hi - lo), 0.0, 1.0)
+    m = (m * 255.0).astype(np.uint8)
+    m = cv2.resize(m, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+    return cv2.applyColorMap(m, cv2.COLORMAP_INFERNO)
+
+
+def fuse_spectrograms(spec_a, spec_b, mode):
+    if spec_b is None:
+        return spec_a
+    if mode == "diff":
+        return np.abs(spec_a - spec_b)
+    if mode == "interleave":
+        out = np.zeros_like(spec_a)
+        out[0::2, :] = spec_a[0::2, :]
+        out[1::2, :] = spec_b[1::2, :]
+        return out
+    return 0.5 * (spec_a + spec_b)
+
+
+def try_load_wificam_model(args):
+    if not args.thru_wall_recon_enable:
+        return None, None, None, "disabled"
+
+    ckpt = Path(args.thru_wall_checkpoint)
+    if not ckpt.exists():
+        return None, None, None, f"checkpoint missing: {ckpt.name}"
+
+    try:
+        import torch
+    except Exception as exc:
+        return None, None, None, f"torch unavailable: {exc}"
+
+    if str(WIFICAM_ROOT) not in sys.path:
+        sys.path.insert(0, str(WIFICAM_ROOT))
+    try:
+        from mopoevae import MoPoEVAE
+    except Exception as exc:
+        return None, None, None, f"WiFiCam import failed: {exc}"
+
+    levels = int(math.ceil(math.log(max(2, args.thru_wall_window_size), 2)))
+    try:
+        model = MoPoEVAE.load_from_checkpoint(
+            str(ckpt),
+            weight_ll=True,
+            lr=1e-3,
+            sequence_length=args.thru_wall_window_size,
+            z_dim=args.thru_wall_zdim,
+            frequence_L=levels,
+            aggregate_method=args.thru_wall_aggregate,
+            map_location=args.thru_wall_device,
+            imgMean=np.array([0.5, 0.5, 0.5], dtype=np.float32),
+            imgStd=np.array([0.25, 0.25, 0.25], dtype=np.float32),
+            log=False,
+        )
+        model.to(args.thru_wall_device)
+        model.eval()
+        return model, torch, levels, "model loaded"
+    except Exception as exc:
+        return None, None, None, f"model load failed: {exc}"
+
+
+def run_wificam_inference(model, torch, levels, spectro_np, args):
+    spec = torch.from_numpy(spectro_np.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(args.thru_wall_device)
+
+    tenc_base = encode_time(np.array([0], dtype=np.float32), levels, args.thru_wall_window_size)
+    spect_t = torch.tensor(tenc_base, dtype=torch.float32).unsqueeze(0)
+    image_t = torch.tensor(tenc_base, dtype=torch.float32).unsqueeze(0)
+    tenc = torch.cat((spect_t, image_t), dim=2).unsqueeze(0).to(args.thru_wall_device)
+
+    spectro = (tenc, spec)
+    image_dummy = (tenc, torch.zeros((1, 3, 128, 128), dtype=torch.float32, device=args.thru_wall_device))
+
+    with torch.no_grad():
+        recon = model.decode(model.encode_subset([spectro, image_dummy], [0]))[1][0][1]
+
+    img = recon[0].detach().cpu().permute(1, 2, 0).numpy()
+    img = np.clip((img * 0.25 + 0.5), 0.0, 1.0)
+    lo = float(np.percentile(img, 1))
+    hi = float(np.percentile(img, 99))
+    if hi > lo + 1e-6:
+        img = np.clip((img - lo) / (hi - lo), 0.0, 1.0)
+    img = (img * 255.0).astype(np.uint8)
+    return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+
+def trim_timed_buffer(buf, window_ms, now_ts):
+    cutoff = now_ts - (max(1.0, float(window_ms)) / 1000.0)
+    while buf and buf[0][0] < cutoff:
+        buf.popleft()
+
+
+def append_timed_vector(buf, now_ts, values, max_window_ms):
+    buf.append((float(now_ts), np.asarray(values, dtype=np.float32).copy()))
+    trim_timed_buffer(buf, max_window_ms, now_ts)
+
+
+def gaussian_time_weights(timestamps, now_ts, sigma_ms):
+    if len(timestamps) == 0:
+        return np.zeros((0,), dtype=np.float32)
+    sigma_s = max(1e-3, float(sigma_ms) / 1000.0)
+    dt = np.asarray([now_ts - ts for ts in timestamps], dtype=np.float32)
+    w = np.exp(-0.5 * (dt / sigma_s) ** 2)
+    w_sum = float(np.sum(w))
+    if w_sum <= 1e-9:
+        return np.ones_like(w) / max(1, w.size)
+    return w / w_sum
+
+
+def compute_smoothed_phase_profile(buf, now_ts, window_ms, sigma_ms, min_samples):
+    trim_timed_buffer(buf, window_ms, now_ts)
+    if len(buf) < int(min_samples):
+        return None
+    timestamps = [ts for ts, _ in buf]
+    phase_stack = np.stack([phase for _, phase in buf], axis=0)
+    weights = gaussian_time_weights(timestamps, now_ts, sigma_ms)[:, None]
+    if phase_stack.shape[1] == 0:
+        return None
+
+    # Remove per-packet constant offset and work with phase trend across bins.
+    phase_rad = np.deg2rad(phase_stack / 100.0)
+    packet_offset = np.angle(np.mean(np.exp(1j * phase_rad), axis=1, keepdims=True))
+    phase_rad = wrap_rad(phase_rad - packet_offset)
+
+    vec = np.sum(weights * np.exp(1j * phase_rad), axis=0)
+    profile = np.angle(vec)
+    confidence = float(np.mean(np.abs(vec)))
+    return profile, confidence, len(buf)
+
+
+def pairwise_phase_coherence(profile_a, profile_b):
+    if profile_a is None or profile_b is None:
+        return None
+    diff = wrap_rad(profile_a - profile_b)
+    return float(np.mean(np.cos(diff)))
+
+
+def draw_reconstruction_panel(canvas, spec_fused, recon_img, model_status):
+    heat = build_spectrogram_heatmap(spec_fused, out_w=220, out_h=110)
+    recon = cv2.resize(recon_img, (220, 110), interpolation=cv2.INTER_LINEAR) if recon_img is not None else np.zeros_like(heat)
+    h, w = canvas.shape[:2]
+    panel_h = 158
+    panel_w = 470
+    x0 = max(8, w - panel_w - 12)
+    y0 = 8
+    x1 = min(w - 1, x0 + panel_w)
+    y1 = min(h - 1, y0 + panel_h)
+    cv2.rectangle(canvas, (x0, y0), (x1, y1), (0, 0, 0), -1)
+    cv2.rectangle(canvas, (x0, y0), (x1, y1), (70, 70, 70), 1)
+    canvas[y0 + 30 : y0 + 140, x0 + 10 : x0 + 230] = heat
+    canvas[y0 + 30 : y0 + 140, x0 + 240 : x0 + 460] = recon
+    cv2.putText(canvas, "CSI Spectrogram", (x0 + 10, y0 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (220, 220, 220), 1, cv2.LINE_AA)
+    cv2.putText(canvas, "Through-Wall Recon", (x0 + 240, y0 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (220, 220, 220), 1, cv2.LINE_AA)
+    cv2.putText(canvas, model_status[:64], (x0 + 10, y0 + 152), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 190, 255), 1, cv2.LINE_AA)
 
 
 def draw_overlay(img, text, y, color=(255, 255, 255)):
@@ -575,6 +782,12 @@ def main():
     args.bins = max(8, args.bins)
     args.stereo_detect_interval = max(1, args.stereo_detect_interval)
     args.stereo_max_missed = max(1, args.stereo_max_missed)
+    args.phase_min_samples = max(2, args.phase_min_samples)
+    args.phase_window_ms = max(50.0, args.phase_window_ms)
+    args.phase_gaussian_sigma_ms = max(10.0, args.phase_gaussian_sigma_ms)
+    args.thru_wall_window_size = max(8, args.thru_wall_window_size)
+    args.thru_wall_subcarriers = max(8, args.thru_wall_subcarriers)
+    args.thru_wall_infer_every = max(1, args.thru_wall_infer_every)
 
     def _open_serial_or_warn(port, baud, timeout=0.03, label="serial"):
         if not port:
@@ -634,11 +847,23 @@ def main():
             print(f"[WARN] IMU serial disabled: {exc}")
             imu_serial = None
 
+    phase_hist_a = deque()
+    phase_hist_b = deque()
+    phase_hist_c = deque()
+    amp_win_a = deque(maxlen=args.thru_wall_window_size)
+    amp_win_b = deque(maxlen=args.thru_wall_window_size)
+    amp_win_c = deque(maxlen=args.thru_wall_window_size)
+    wificam_model, wificam_torch, wificam_levels, wificam_status = try_load_wificam_model(args)
+    last_recon = np.zeros((128, 128, 3), dtype=np.uint8)
+    recon_error = ""
+    recon_frame_i = 0
+
     latest_seq = 0
     latest_rssi = -127
     latest_len = 0
     latest_version = "N/A"
     latest_amp = np.zeros((args.bins,), dtype=np.uint8)
+    latest_phase = np.zeros((args.bins,), dtype=np.float32)
     latest_cam_serial = "N/A"
     fps_counter = 0
     fps_time = time.time()
@@ -667,6 +892,18 @@ def main():
     fused_assoc_err = 999.0
     fused_wifi_yaw = 0.0
     fused_yolo_yaw = 0.0
+    phase_profile_a = None
+    phase_profile_b = None
+    phase_profile_c = None
+    phase_conf_a = 0.0
+    phase_conf_b = 0.0
+    phase_conf_c = 0.0
+    phase_samples_a = 0
+    phase_samples_b = 0
+    phase_samples_c = 0
+    phase_coherence_ab = None
+    phase_coherence_ac = None
+    phase_coherence_bc = None
 
     window_name = "CSI OpenGL Viewer"
     try:
@@ -679,28 +916,51 @@ def main():
             line = ser.readline().decode("utf-8", errors="ignore").strip()
             parsed = parse_csi_line(line) if line else None
             if parsed is not None:
+                sample_ts = time.time()
                 latest_seq = parsed["seq"]
                 latest_rssi = parsed["rssi"]
                 latest_len = parsed["raw_len"]
                 latest_version = parsed["version"]
                 amp = np.array(parsed["amp"][: args.bins], dtype=np.float32)
+                phase = np.array(parsed["phase"][: args.bins], dtype=np.float32)
                 latest_amp[:] = 0
+                latest_phase[:] = 0
                 if amp.size > 0:
                     amp = np.clip(amp, 0.0, 255.0)
                     latest_amp[: amp.shape[0]] = amp.astype(np.uint8)
+                    amp_win_a.append(to_model_subcarriers(amp, args.thru_wall_subcarriers))
+                if phase.size > 0:
+                    latest_phase[: phase.shape[0]] = phase
+                    append_timed_vector(phase_hist_a, sample_ts, phase, args.phase_window_ms * 1.25)
 
             if ser_b is not None:
                 line_b = ser_b.readline().decode("utf-8", errors="ignore").strip()
                 parsed_b = parse_csi_line(line_b) if line_b else None
                 if parsed_b is not None:
+                    sample_ts_b = time.time()
                     latest_rssi_b = parsed_b["rssi"]
                     seen_b = True
+                    amp_b = np.array(parsed_b["amp"][: args.bins], dtype=np.float32)
+                    phase_b = np.array(parsed_b["phase"][: args.bins], dtype=np.float32)
+                    if amp_b.size > 0:
+                        amp_b = np.clip(amp_b, 0.0, 255.0)
+                        amp_win_b.append(to_model_subcarriers(amp_b, args.thru_wall_subcarriers))
+                    if phase_b.size > 0:
+                        append_timed_vector(phase_hist_b, sample_ts_b, phase_b, args.phase_window_ms * 1.25)
             if ser_c is not None:
                 line_c = ser_c.readline().decode("utf-8", errors="ignore").strip()
                 parsed_c = parse_csi_line(line_c) if line_c else None
                 if parsed_c is not None:
+                    sample_ts_c = time.time()
                     latest_rssi_c = parsed_c["rssi"]
                     seen_c = True
+                    amp_c = np.array(parsed_c["amp"][: args.bins], dtype=np.float32)
+                    phase_c = np.array(parsed_c["phase"][: args.bins], dtype=np.float32)
+                    if amp_c.size > 0:
+                        amp_c = np.clip(amp_c, 0.0, 255.0)
+                        amp_win_c.append(to_model_subcarriers(amp_c, args.thru_wall_subcarriers))
+                    if phase_c.size > 0:
+                        append_timed_vector(phase_hist_c, sample_ts_c, phase_c, args.phase_window_ms * 1.25)
 
             if camera_serial is not None:
                 cam_line = camera_serial.readline().decode("utf-8", errors="ignore").strip()
@@ -719,6 +979,48 @@ def main():
                 csi_strength_smoothed_b = (0.85 * csi_strength_smoothed_b) + (0.15 * float(np.clip((latest_rssi_b + 95.0) / 60.0, 0.0, 1.0)))
             if seen_c:
                 csi_strength_smoothed_c = (0.85 * csi_strength_smoothed_c) + (0.15 * float(np.clip((latest_rssi_c + 95.0) / 60.0, 0.0, 1.0)))
+
+            now_ts = time.time()
+            if args.phase_coherence_enable:
+                phase_result_a = compute_smoothed_phase_profile(phase_hist_a, now_ts, args.phase_window_ms, args.phase_gaussian_sigma_ms, args.phase_min_samples)
+                phase_result_b = compute_smoothed_phase_profile(phase_hist_b, now_ts, args.phase_window_ms, args.phase_gaussian_sigma_ms, args.phase_min_samples)
+                phase_result_c = compute_smoothed_phase_profile(phase_hist_c, now_ts, args.phase_window_ms, args.phase_gaussian_sigma_ms, args.phase_min_samples)
+                if phase_result_a is not None:
+                    phase_profile_a, phase_conf_a, phase_samples_a = phase_result_a
+                else:
+                    phase_profile_a, phase_conf_a, phase_samples_a = None, 0.0, len(phase_hist_a)
+                if phase_result_b is not None:
+                    phase_profile_b, phase_conf_b, phase_samples_b = phase_result_b
+                else:
+                    phase_profile_b, phase_conf_b, phase_samples_b = None, 0.0, len(phase_hist_b)
+                if phase_result_c is not None:
+                    phase_profile_c, phase_conf_c, phase_samples_c = phase_result_c
+                else:
+                    phase_profile_c, phase_conf_c, phase_samples_c = None, 0.0, len(phase_hist_c)
+                phase_coherence_ab = pairwise_phase_coherence(phase_profile_a, phase_profile_b)
+                phase_coherence_ac = pairwise_phase_coherence(phase_profile_a, phase_profile_c)
+                phase_coherence_bc = pairwise_phase_coherence(phase_profile_b, phase_profile_c)
+            else:
+                phase_coherence_ab = None
+                phase_coherence_ac = None
+                phase_coherence_bc = None
+
+            spec_a = np.stack(amp_win_a, axis=0).T if len(amp_win_a) >= args.thru_wall_window_size else None
+            spec_b = np.stack(amp_win_b, axis=0).T if len(amp_win_b) >= args.thru_wall_window_size else None
+            need_recon_b = ser_b is not None and len(amp_win_b) >= args.thru_wall_window_size
+            spec_fused = None
+            if spec_a is not None:
+                spec_fused = fuse_spectrograms(spec_a, spec_b if need_recon_b else None, args.thru_wall_fusion)
+                recon_frame_i += 1
+                if args.thru_wall_recon_enable and (recon_frame_i % args.thru_wall_infer_every == 0):
+                    if wificam_model is not None:
+                        try:
+                            last_recon = run_wificam_inference(wificam_model, wificam_torch, wificam_levels, spec_fused, args)
+                            recon_error = ""
+                        except Exception as exc:
+                            recon_error = str(exc)[:120]
+                    else:
+                        last_recon = build_spectrogram_heatmap(spec_fused, out_w=128, out_h=128)
 
             csi_max_strength = max(csi_strength_smoothed, csi_strength_smoothed_b, csi_strength_smoothed_c)
             wifi_present = csi_max_strength >= float(args.presence_threshold)
@@ -841,10 +1143,28 @@ def main():
                             status_lines.append(f"trilat_xy=({trilat_xy[0]:.2f},{trilat_xy[1]:.2f})m d=({trilat_d[0]:.2f},{trilat_d[1]:.2f},{trilat_d[2]:.2f})m")
                         else:
                             status_lines.append("trilat_xy=N/A (need 3 CSI nodes: A+B+C)")
+                    if args.phase_coherence_enable:
+                        phase_line = f"phase win={int(args.phase_window_ms)}ms sigma={int(args.phase_gaussian_sigma_ms)}ms A/B="
+                        phase_line += f"{phase_coherence_ab:.2f}" if phase_coherence_ab is not None else "N/A"
+                        if ser_c is not None:
+                            phase_line += " A/C="
+                            phase_line += f"{phase_coherence_ac:.2f}" if phase_coherence_ac is not None else "N/A"
+                            phase_line += " B/C="
+                            phase_line += f"{phase_coherence_bc:.2f}" if phase_coherence_bc is not None else "N/A"
+                        status_lines.append(phase_line)
+                        status_lines.append(f"phase conf(a,b,c)=({phase_conf_a:.2f},{phase_conf_b:.2f},{phase_conf_c:.2f}) n=({phase_samples_a},{phase_samples_b},{phase_samples_c})")
+                    if args.thru_wall_recon_enable:
+                        recon_line = f"recon={'MODEL' if wificam_model is not None else 'HEATMAP'} fusion={args.thru_wall_fusion} win={args.thru_wall_window_size}"
+                        if recon_error:
+                            recon_line += " err"
+                        status_lines.append(recon_line)
                     if camera_serial is not None:
                         status_lines.append(f"serial={latest_cam_serial[:64]}")
                     status_lines.append("Press q to quit")
                     draw_status_box(stereo_panel, status_lines, x=10, y=34, line_h=22, text_color=accent_color, border_color=accent_color)
+                    if args.thru_wall_recon_enable and spec_fused is not None:
+                        recon_status = wificam_status if not recon_error else f"model error: {recon_error}"
+                        draw_reconstruction_panel(stereo_panel, spec_fused, last_recon, recon_status)
                     if presence_on:
                         cv2.rectangle(stereo_panel, (0, 0), (stereo_panel.shape[1] - 1, stereo_panel.shape[0] - 1), MIKU_BLUE, 2)
                     if fused_assoc:
@@ -874,11 +1194,18 @@ def main():
                 draw_overlay(frame, f"seq={latest_seq} rssi={latest_rssi} len={latest_len} fmt={latest_version}", 92, color=accent_color)
                 draw_overlay(frame, f"csi_strength(a,b,c)=({csi_strength_smoothed:.2f},{csi_strength_smoothed_b:.2f},{csi_strength_smoothed_c:.2f}) presence={'ON' if presence_on else 'OFF'}", 118, color=accent_color)
                 draw_overlay(frame, f"imu_yaw={latest_imu['yaw']:.1f} fusion={'ON' if args.fusion_enable else 'OFF'}", 144, color=accent_color)
+                if args.phase_coherence_enable:
+                    phase_text = "phase A/B="
+                    phase_text += f"{phase_coherence_ab:.2f}" if phase_coherence_ab is not None else "N/A"
+                    draw_overlay(frame, phase_text, 170, color=accent_color)
                 if args.trilateration_enable and trilat_xy is not None:
-                    draw_overlay(frame, f"trilat_xy=({trilat_xy[0]:.2f},{trilat_xy[1]:.2f})m", 170, color=accent_color)
-                    draw_overlay(frame, "Press q to quit", 196, color=accent_color)
+                    draw_overlay(frame, f"trilat_xy=({trilat_xy[0]:.2f},{trilat_xy[1]:.2f})m", 196, color=accent_color)
+                    draw_overlay(frame, "Press q to quit", 222, color=accent_color)
                 else:
-                    draw_overlay(frame, "Press q to quit", 170, color=accent_color)
+                    draw_overlay(frame, "Press q to quit", 196 if args.phase_coherence_enable else 170, color=accent_color)
+                if args.thru_wall_recon_enable and spec_fused is not None:
+                    recon_status = wificam_status if not recon_error else f"model error: {recon_error}"
+                    draw_reconstruction_panel(frame, spec_fused, last_recon, recon_status)
                 if presence_on:
                     cv2.rectangle(frame, (0, 0), (frame.shape[1] - 1, frame.shape[0] - 1), MIKU_BLUE, 2)
                 canvas = frame
@@ -897,13 +1224,25 @@ def main():
                 draw_overlay(wave, f"Raw len: {latest_len}", 104, color=accent_color)
                 draw_overlay(wave, f"Format: {latest_version}", 130, color=accent_color)
                 draw_overlay(wave, f"RSSI(b,c)=({latest_rssi_b},{latest_rssi_c}) dBm", 156, color=accent_color)
+                y_cursor = 182
+                if args.phase_coherence_enable:
+                    phase_text = "Phase A/B="
+                    phase_text += f"{phase_coherence_ab:.2f}" if phase_coherence_ab is not None else "N/A"
+                    draw_overlay(wave, phase_text, y_cursor, color=accent_color)
+                    y_cursor += 26
                 if args.trilateration_enable and trilat_xy is not None:
-                    draw_overlay(wave, f"Trilat XY: ({trilat_xy[0]:.2f},{trilat_xy[1]:.2f})m", 182, color=accent_color)
-                    draw_overlay(wave, f"Presence: {'ON' if presence_on else 'OFF'}", 208, color=accent_color)
-                    draw_overlay(wave, "Press q to quit", 234, color=accent_color)
+                    draw_overlay(wave, f"Trilat XY: ({trilat_xy[0]:.2f},{trilat_xy[1]:.2f})m", y_cursor, color=accent_color)
+                    y_cursor += 26
+                    draw_overlay(wave, f"Presence: {'ON' if presence_on else 'OFF'}", y_cursor, color=accent_color)
+                    y_cursor += 26
+                    draw_overlay(wave, "Press q to quit", y_cursor, color=accent_color)
                 else:
-                    draw_overlay(wave, f"Presence: {'ON' if presence_on else 'OFF'}", 182, color=accent_color)
-                    draw_overlay(wave, "Press q to quit", 208, color=accent_color)
+                    draw_overlay(wave, f"Presence: {'ON' if presence_on else 'OFF'}", y_cursor, color=accent_color)
+                    y_cursor += 26
+                    draw_overlay(wave, "Press q to quit", y_cursor, color=accent_color)
+                if args.thru_wall_recon_enable and spec_fused is not None:
+                    recon_status = wificam_status if not recon_error else f"model error: {recon_error}"
+                    draw_reconstruction_panel(wave, spec_fused, last_recon, recon_status)
                 if presence_on:
                     cv2.rectangle(wave, (0, 0), (wave.shape[1] - 1, wave.shape[0] - 1), MIKU_BLUE, 2)
                 canvas = wave
